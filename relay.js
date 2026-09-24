@@ -71,9 +71,19 @@
       const digest = new Uint8Array(await crypto.subtle.digest(
         "SHA-256", new TextEncoder().encode("azgames-room:" + this.id)));
       this.tag = hex(digest).slice(0, 32);
-      await Promise.any(RELAYS.map(url => this._connect(url)))
-        .catch(() => { throw new Error("Could not reach any relay. Check the internet connection."); });
-      return this;
+      // A relay can be slow to answer a first handshake; try a few rounds,
+      // each more patient than the last, before giving up.
+      for (let round = 0; round < 4; round++) {
+        try {
+          await Promise.any(RELAYS.filter(url => !this.sockets.has(url))
+                                  .map(url => this._connect(url, 0, 8000 + round * 6000)));
+          return this;
+        } catch (err) {
+          if (this.live) return this;
+          await new Promise(r => setTimeout(r, 1000 + round * 1500));
+        }
+      }
+      throw new Error("Could not reach the game relays. Check the internet connection and try again.");
     }
 
     on(fn) { this.handlers.push(fn); }
@@ -82,13 +92,15 @@
 
     _status() { for (const fn of this.statusHandlers) fn(this.live); }
 
-    _connect(url, attempt = 0) {
+    _connect(url, attempt = 0, patience = 12000) {
       return new Promise((resolve, reject) => {
         if (this.closed) { reject(new Error("closed")); return; }
         let ws;
         try { ws = new WebSocket(url); } catch (err) { reject(err); return; }
-        const timer = setTimeout(() => { try { ws.close(); } catch (e) { /* gone */ } reject(new Error("timeout")); }, 9000);
+        const timer = setTimeout(() => { try { ws.close(); } catch (e) { /* gone */ } reject(new Error("timeout")); }, patience);
+        let opened = false;
         ws.onopen = () => {
+          opened = true;
           clearTimeout(timer);
           this.sockets.set(url, ws);
           ws.send(JSON.stringify(["REQ", "azg", { kinds: [KIND], "#t": [this.tag], since: this.since }]));
@@ -101,8 +113,9 @@
           clearTimeout(timer);
           if (this.sockets.get(url) === ws) this.sockets.delete(url);
           this._status();
-          if (!this.closed) {
-            // Reconnect with backoff; a relay that is down for good just stays out.
+          if (!this.closed && opened) {
+            // A relay that dropped: reconnect with backoff.  One that never
+            // opened is left to `open()`'s rounds, or stays out if others work.
             const wait = Math.min(30000, 1500 * 2 ** Math.min(attempt, 5));
             setTimeout(() => this._connect(url, attempt + 1).catch(() => {}), wait);
           }
