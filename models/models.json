@@ -1,0 +1,150 @@
+{
+ "hex": {
+  "file": "models/hex.onnx",
+  "input_shape": [
+   10,
+   11,
+   11
+  ],
+  "outputs": [
+   "policy",
+   "value"
+  ],
+  "cfg": {
+   "channels": 64,
+   "blocks": 10,
+   "head_channels": 32,
+   "value_hidden": 64,
+   "in_planes": 10,
+   "gp_every": 3,
+   "gp_channels": 32,
+   "aux_head": true,
+   "wdl": false,
+   "ply_head": false,
+   "policy_planes": 1
+  },
+  "ckpt": "v2_final.pt"
+ },
+ "c4": {
+  "file": "models/c4.onnx",
+  "input_shape": [
+   3,
+   6,
+   7
+  ],
+  "outputs": [
+   "policy",
+   "value"
+  ],
+  "cfg": {
+   "channels": 64,
+   "blocks": 6,
+   "head_channels": 32,
+   "value_hidden": 64,
+   "in_planes": 3,
+   "gp_every": 0,
+   "gp_channels": 32,
+   "aux_head": false,
+   "wdl": false,
+   "ply_head": false,
+   "policy_planes": 1
+  },
+  "ckpt": "final.pt"
+ },
+ "uttt": {
+  "file": "models/uttt.onnx",
+  "input_shape": [
+   23,
+   9,
+   9
+  ],
+  "outputs": [
+   "policy",
+   "value"
+  ],
+  "cfg": {
+   "channels": 64,
+   "blocks": 6,
+   "head_channels": 32,
+   "value_hidden": 64,
+   "in_planes": 23,
+   "gp_every": 3,
+   "gp_channels": 32,
+   "aux_head": true,
+   "wdl": true,
+   "ply_head": false,
+   "policy_planes": 1
+  },
+  "ckpt": "final.pt"
+ },
+ "rps2": {
+  "file": "models/rps2.onnx",
+  "input_shape": [
+   30,
+   9,
+   9
+  ],
+  "outputs": [
+   "policy",
+   "value"
+  ],
+  "cfg": {
+   "channels": 64,
+   "blocks": 8,
+   "head_channels": 32,
+   "value_hidden": 64,
+   "in_planes": 30,
+   "gp_every": 3,
+   "gp_channels": 32,
+   "aux_head": true,
+   "wdl": true,
+   "ply_head": true,
+   "policy_planes": 8
+  },
+  "ckpt": "latest.pt"
+ },
+ "bg": {
+  "file": "models/bg.onnx",
+  "input_shape": [
+   196
+  ],
+  "outputs": [
+   "forward",
+   "equities"
+  ],
+  "cfg": {
+   "inputs": 196,
+   "hidden": [
+    256,
+    128,
+    64
+   ],
+   "features": "basic",
+   "outputs": 1
+  },
+  "ckpt": "final.pt"
+ },
+ "splendor3": {
+  "file": "models/splendor3.onnx",
+  "input_shape": [
+   988
+  ],
+  "outputs": [
+   "policy",
+   "value"
+  ],
+  "cfg": {
+   "inputs": 988,
+   "actions": 72,
+   "seats": 4,
+   "token_width": 32,
+   "token_blocks": 1,
+   "heads": 4,
+   "width": 320,
+   "blocks": 4,
+   "value_hidden": 128,
+   "features": "s3"
+  },
+  "ckpt": "latest.pt"
+ }
+}
