@@ -4,5 +4,6 @@
  "uttt": "runs/az_uttt_v2/final.pt",
  "rps2": "runs/az_rps2/latest.pt",
  "bg": "runs/az_bg/final.pt",
+ "uttt_v3": "runs/uttt_v3/best.pt",
  "splendor3": "runs/az_splendor3/latest.pt"
 }

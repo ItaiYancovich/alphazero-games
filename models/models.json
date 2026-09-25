@@ -124,6 +124,34 @@
   },
   "ckpt": "final.pt"
  },
+ "uttt_v3": {
+  "file": "models/uttt_v3.onnx",
+  "input_shape": [
+   23,
+   9,
+   9
+  ],
+  "outputs": [
+   "policy",
+   "value",
+   "q"
+  ],
+  "cfg": {
+   "arch": "H",
+   "channels": 128,
+   "blocks": 6,
+   "pattern": "RRTRRT",
+   "t_layers": 6,
+   "heads": 8,
+   "ffn_ratio": 2.0,
+   "smolgen": true,
+   "board_local": false,
+   "block": "nbt",
+   "in_planes": 23,
+   "version": 3
+  },
+  "ckpt": "best.pt"
+ },
  "splendor3": {
   "file": "models/splendor3.onnx",
   "input_shape": [
