@@ -1,0 +1,137 @@
+{
+  "anchor": "random",
+  "anchor_rating": 1000.0,
+  "board_size": 11,
+  "games_per_pair": 16,
+  "n_games": 1456,
+  "first_player_advantage": 22.461836237410047,
+  "generated": "2026-08-22T00:35:47+00:00",
+  "bots": {
+    "az@1600": {
+      "label": "AlphaZero 1600 sims",
+      "elo": 3994.7,
+      "err": 78.5,
+      "games": 208,
+      "wins": 190,
+      "win_rate": 0.9135,
+      "sec_per_move": 9.206
+    },
+    "az@400": {
+      "label": "AlphaZero 400 sims",
+      "elo": 3937.5,
+      "err": 76.6,
+      "games": 208,
+      "wins": 184,
+      "win_rate": 0.8846,
+      "sec_per_move": 2.321
+    },
+    "az@100": {
+      "label": "AlphaZero 100 sims",
+      "elo": 3835.7,
+      "err": 74.3,
+      "games": 208,
+      "wins": 172,
+      "win_rate": 0.8269,
+      "sec_per_move": 0.636
+    },
+    "az:final@1600": {
+      "label": "AlphaZero[final] 1600 sims",
+      "elo": 3772.3,
+      "err": 73.4,
+      "games": 208,
+      "wins": 164,
+      "win_rate": 0.7885,
+      "sec_per_move": 4.903
+    },
+    "az@0": {
+      "label": "AlphaZero policy (no search)",
+      "elo": 3607.2,
+      "err": 72.1,
+      "games": 208,
+      "wins": 143,
+      "win_rate": 0.6875,
+      "sec_per_move": 0.013
+    },
+    "az:final@400": {
+      "label": "AlphaZero[final] 400 sims",
+      "elo": 3574.3,
+      "err": 72.0,
+      "games": 208,
+      "wins": 139,
+      "win_rate": 0.6683,
+      "sec_per_move": 1.236
+    },
+    "az:final@100": {
+      "label": "AlphaZero[final] 100 sims",
+      "elo": 3440.0,
+      "err": 72.0,
+      "games": 208,
+      "wins": 124,
+      "win_rate": 0.5962,
+      "sec_per_move": 0.352
+    },
+    "az:final@0": {
+      "label": "AlphaZero[final] policy (no search)",
+      "elo": 3135.8,
+      "err": 73.6,
+      "games": 208,
+      "wins": 99,
+      "win_rate": 0.476,
+      "sec_per_move": 0.006
+    },
+    "rollout:3.0": {
+      "label": "Rollout MCTS 3s",
+      "elo": 2801.7,
+      "err": 80.7,
+      "games": 208,
+      "wins": 79,
+      "win_rate": 0.3798,
+      "sec_per_move": 2.939
+    },
+    "rollout:1.0": {
+      "label": "Rollout MCTS 1s",
+      "elo": 2551.2,
+      "err": 88.4,
+      "games": 208,
+      "wins": 65,
+      "win_rate": 0.3125,
+      "sec_per_move": 0.989
+    },
+    "minimax:3.0": {
+      "label": "Alpha-beta 3s",
+      "elo": 2120.5,
+      "err": 107.7,
+      "games": 208,
+      "wins": 41,
+      "win_rate": 0.1971,
+      "sec_per_move": 2.541
+    },
+    "minimax:1.0": {
+      "label": "Alpha-beta 1s",
+      "elo": 2086.6,
+      "err": 109.0,
+      "games": 208,
+      "wins": 39,
+      "win_rate": 0.1875,
+      "sec_per_move": 0.937
+    },
+    "rule": {
+      "label": "Rule-based",
+      "elo": 1618.7,
+      "err": 145.5,
+      "games": 208,
+      "wins": 17,
+      "win_rate": 0.0817,
+      "sec_per_move": 0.004
+    },
+    "random": {
+      "label": "Random",
+      "elo": 1000.0,
+      "err": 266.7,
+      "games": 208,
+      "wins": 0,
+      "win_rate": 0.0,
+      "sec_per_move": 0.0
+    }
+  }
+}

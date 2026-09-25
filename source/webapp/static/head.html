@@ -1,0 +1,106 @@
+<!-- web build: cross-origin isolation first, so the engine's shared memory works -->
+<script src="coi-serviceworker.js"></script>
+<meta name="description" content="Play Hex, Connect Four, Ultimate Tic-Tac-Toe, Backgammon, Splendor and more against AlphaZero bots that run in your own browser, or online against a friend.">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<style>
+  /* ------------------------------------------------------ first-load screen */
+  #boot-overlay {
+    position: fixed; inset: 0; z-index: 100; display: flex; align-items: center;
+    justify-content: center; padding: 24px; background: var(--md-bg);
+    transition: opacity .35s var(--md-ease);
+  }
+  #boot-overlay.done { opacity: 0; pointer-events: none; }
+  .boot-card {
+    width: min(440px, 100%); background: var(--md-surface); border-radius: 28px;
+    padding: 32px 28px 28px; text-align: center; box-shadow: var(--md-shadow-1);
+  }
+  .boot-card svg.logo { width: 56px; height: 56px; margin: 0 auto 16px; }
+  .boot-card h1 { font-size: 24px; font-weight: 500; margin: 0 0 6px; }
+  .boot-card p { color: var(--dim); margin: 0 0 22px; font-size: 14px; }
+  .boot-track { height: 4px; border-radius: 2px; background: var(--md-primary-container);
+                overflow: hidden; }
+  #boot-bar { height: 100%; width: 3%; background: var(--md-primary); border-radius: 2px;
+              transition: width .4s var(--md-ease); }
+  #boot-status { margin-top: 12px; font-size: 13px; color: var(--dim); min-height: 20px; }
+  #boot-overlay.failed #boot-bar { background: #b3261e; }
+  #boot-overlay.failed #boot-status { color: #b3261e; font-weight: 500; }
+  .boot-note { margin-top: 18px; font-size: 12px; color: var(--faint); }
+
+  /* ------------------------------------------------------------- online */
+  #online-btn .lbl { margin-left: 2px; }
+  .online-chip {
+    display: inline-flex; align-items: center; gap: 8px; height: 32px; padding: 0 12px;
+    border-radius: 16px; background: var(--md-surface-3); color: var(--ink);
+    font-size: 13px; font-weight: 500; cursor: pointer; border: 0;
+  }
+  .online-chip i { width: 8px; height: 8px; border-radius: 50%; background: var(--md-outline); }
+  .online-chip.live i { background: #1e8e3e; box-shadow: 0 0 0 3px rgba(30, 142, 62, .2); }
+  .online-chip[hidden] { display: none; }
+
+  dialog.web-dialog {
+    border: 0; border-radius: 28px; padding: 0; width: min(480px, calc(100vw - 32px));
+    background: var(--md-surface); color: var(--ink); box-shadow: var(--md-shadow-3);
+  }
+  dialog.web-dialog::backdrop { background: rgba(0, 0, 0, .32); }
+  .dlg { padding: 24px; }
+  .dlg h2 { margin: 0 0 8px; font-size: 22px; font-weight: 400; }
+  .dlg p { margin: 0 0 16px; color: var(--dim); font-size: 14px; line-height: 1.5; }
+  .dlg .link-row { display: flex; gap: 8px; margin-bottom: 14px; }
+  .dlg input[type=text] {
+    flex: 1; min-width: 0; height: 44px; padding: 0 12px; font: 14px var(--mono);
+    border: 1px solid var(--md-outline); border-radius: 8px; background: var(--md-surface-1);
+    color: var(--ink);
+  }
+  .dlg .actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 20px;
+                  flex-wrap: wrap; }
+  .dlg .wait { display: flex; align-items: center; gap: 12px; color: var(--dim);
+               font-size: 14px; margin: 8px 0 4px; }
+  .spinner { width: 20px; height: 20px; border-radius: 50%; flex: none;
+             border: 3px solid var(--md-primary-container); border-top-color: var(--md-primary);
+             animation: spin 0.9s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .dlg .err { color: #b3261e; font-size: 14px; margin: 8px 0; }
+  .dlg .row-seat { display: flex; align-items: center; gap: 12px; margin-top: 4px; }
+  .dlg .row-seat select { flex: 0 0 180px; }
+
+  /* The online card in the Play tab takes the place of the player pickers. */
+  #online-card { display: none; }
+  body.online #online-card { display: block; }
+  body.online #players-sec { display: none; }
+  body.online #details-sec, body.online .switch-row:has(#rated) { display: none; }
+  body.online-guest #panel-play .section:not(#online-card) { display: none; }
+  body.online #eval-card { display: none; }
+
+  #web-toast {
+    position: fixed; left: 50%; bottom: 24px; z-index: 70; transform: translate(-50%, 20px);
+    padding: 12px 18px; border-radius: 8px; background: var(--md-inverse-surface);
+    color: var(--md-inverse-on-surface); font-size: 14px; box-shadow: var(--md-shadow-3);
+    opacity: 0; pointer-events: none; transition: opacity .2s, transform .2s var(--md-ease);
+  }
+  #web-toast.on { opacity: 1; transform: translate(-50%, 0); }
+
+  #boot-overlay-lost {
+    position: fixed; inset: 0; z-index: 90; display: flex; align-items: center;
+    justify-content: center; background: rgba(0, 0, 0, .32); padding: 24px;
+  }
+  #boot-overlay-lost[hidden] { display: none; }
+
+  /* The bot's last move in numbers, under the board -- where the side panel
+     is not beside it (a phone, or the slide-over panel). */
+  #bot-strip { display: none; }
+  body.mode-stack #bot-strip.on, body.mode-drawer #bot-strip.on {
+    display: flex; flex-wrap: wrap; justify-content: center; gap: 6px; margin-top: 10px;
+  }
+  body.online #bot-strip { display: none !important; }
+  #bot-strip .bchip {
+    font-size: 12.5px; line-height: 1.3; padding: 5px 10px; border-radius: 12px;
+    background: var(--md-surface-2); color: var(--dim); white-space: nowrap;
+  }
+  #bot-strip .bchip b { color: var(--ink); font-weight: 500; font-variant-numeric: tabular-nums; }
+  #bot-strip .bchip.head { background: var(--md-secondary-container);
+                           color: var(--md-on-secondary-container); font-weight: 500; }
+  @media (max-width: 899px) {
+    #online-btn .lbl { display: none; }
+    #online-btn { padding: 0 12px; }
+  }
+</style>

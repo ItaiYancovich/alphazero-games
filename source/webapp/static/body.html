@@ -1,0 +1,147 @@
+
+<!-- ================================================================ web build -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <symbol id="i-group" viewBox="0 0 24 24"><path d="M16 11c1.66 0 2.99-1.34 2.99-3S17.66 5 16 5c-1.66 0-3 1.34-3 3s1.34 3 3 3zm-8 0c1.66 0 2.99-1.34 2.99-3S9.66 5 8 5C6.34 5 5 6.34 5 8s1.34 3 3 3zm0 2c-2.33 0-7 1.17-7 3.5V19h14v-2.5c0-2.33-4.67-3.5-7-3.5zm8 0c-.29 0-.62.02-.97.05 1.16.84 1.97 1.97 1.97 3.45V19h6v-2.5c0-2.33-4.67-3.5-7-3.5z"/></symbol>
+  <symbol id="i-copy" viewBox="0 0 24 24"><path d="M16 1H4c-1.1 0-2 .9-2 2v14h2V3h12V1zm3 4H8c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h11c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm0 16H8V7h11v14z"/></symbol>
+  <symbol id="i-share" viewBox="0 0 24 24"><path d="M18 16.08c-.76 0-1.44.3-1.96.77L8.91 12.7c.05-.23.09-.46.09-.7s-.04-.47-.09-.7l7.05-4.11c.54.5 1.25.81 2.04.81 1.66 0 3-1.34 3-3s-1.34-3-3-3-3 1.34-3 3c0 .24.04.47.09.7L8.04 9.81C7.5 9.31 6.79 9 6 9c-1.66 0-3 1.34-3 3s1.34 3 3 3c.79 0 1.5-.31 2.04-.81l7.12 4.16c-.05.21-.08.43-.08.65 0 1.61 1.31 2.92 2.92 2.92s2.92-1.31 2.92-2.92-1.31-2.92-2.92-2.92z"/></symbol>
+</svg>
+
+<div id="boot-overlay" role="status" aria-live="polite">
+  <div class="boot-card">
+    <svg class="logo" viewBox="0 0 24 24" aria-hidden="true">
+      <polygon points="20.66,17 12,22 3.34,17 3.34,7 12,2 20.66,7" fill="#0b57d0"/>
+      <circle cx="12" cy="12" r="4" fill="#fff"/>
+    </svg>
+    <h1>AlphaZero Games</h1>
+    <p>Seven board games against bots that think on your own computer — or online against a friend.</p>
+    <div class="boot-track"><div id="boot-bar"></div></div>
+    <div id="boot-status">Starting…</div>
+    <div class="boot-note">The first visit downloads about 30 MB; after that it opens in a moment.</div>
+  </div>
+</div>
+
+<div id="boot-overlay-lost" hidden>
+  <div class="boot-card">
+    <h1>Disconnected</h1>
+    <p id="lost-text">The host left the game.</p>
+    <div class="dlg" style="padding:0"><div class="actions" style="justify-content:center">
+      <button id="lost-offline" class="btn filled">Play on my own</button>
+    </div></div>
+  </div>
+</div>
+
+<!-- Played with a friend: shown in the Play tab instead of the player pickers. -->
+<template id="online-card-tpl">
+  <div class="section" id="online-card">
+    <h2>Online game</h2>
+    <div class="info-card">
+      <p class="sub" style="margin:0 0 12px" id="online-card-text">You are playing a friend over the internet.
+        Pick a game from the tabs at the top — you both switch together.</p>
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
+        <button class="btn tonal" id="online-card-manage"><svg><use href="#i-group"/></svg>Online game</button>
+        <button class="btn text" id="guest-leave">Leave</button>
+      </div>
+    </div>
+  </div>
+</template>
+
+<dialog class="web-dialog" id="online-dialog" aria-labelledby="online-title">
+  <div class="dlg" id="invite-body">
+    <h2 id="online-title">Play a friend online</h2>
+    <p>Send this link to a friend — anywhere, on any network. When they open it,
+      you're playing. The game runs on your computer; nothing to install for either of you.</p>
+    <div id="invite-wait" class="wait"><span class="spinner"></span>Creating your invite link…</div>
+    <div id="invite-ready" hidden>
+      <div class="link-row">
+        <input type="text" id="invite-link" readonly aria-label="Invite link">
+        <button class="btn tonal" id="invite-copy"><svg><use href="#i-copy"/></svg>Copy</button>
+      </div>
+      <div class="row-seat">
+        <span class="sub" style="margin:0;flex:1">Your friend plays</span>
+        <select id="invite-seat" aria-label="Which side your friend plays">
+          <option value="second" selected>Second (you move first)</option>
+          <option value="first">First (they move first)</option>
+        </select>
+      </div>
+      <div class="wait"><span class="spinner"></span>Waiting for your friend to open the link…</div>
+    </div>
+    <div id="invite-error" class="err" hidden></div>
+    <div class="actions">
+      <button class="btn text" id="invite-share" hidden><svg><use href="#i-share"/></svg>Share</button>
+      <button class="btn text" id="invite-stop">Cancel invite</button>
+      <button class="btn filled" id="invite-close">Done</button>
+    </div>
+  </div>
+  <div class="dlg" id="online-live" hidden>
+    <h2>Playing online</h2>
+    <p id="online-live-text">You're connected to your friend. Switch games with the tabs at the top
+      — you both move to the new game together.</p>
+    <div class="actions">
+      <button class="btn text" id="live-leave">End online game</button>
+      <button class="btn tonal" id="live-rematch"><svg><use href="#i-refresh"/></svg>Rematch</button>
+    </div>
+  </div>
+</dialog>
+
+<div id="web-toast" role="status" aria-live="polite"></div>
+
+<script src="nostr.bundle.js"></script>
+<script src="relay.js"></script>
+<script>
+  // Put the online controls into the app bar and the Play tab.
+  (function () {
+    const end = document.querySelector(".appbar-end");
+    const chip = document.createElement("button");
+    chip.className = "online-chip";
+    chip.id = "online-chip";
+    chip.hidden = true;
+    chip.innerHTML = '<i></i><span id="online-chip-text">Online</span>';
+    const btn = document.createElement("button");
+    btn.className = "btn tonal";
+    btn.id = "online-btn";
+    btn.title = "Play a friend online";
+    btn.innerHTML = '<svg><use href="#i-group"/></svg><span class="lbl">Play online</span>';
+    end.prepend(btn);
+    end.prepend(chip);
+    const players = document.querySelector("#panel-play > .section");
+    if (players) players.id = "players-sec";
+    const card = document.getElementById("online-card-tpl").content.cloneNode(true);
+    document.getElementById("panel-play").prepend(card);
+    document.getElementById("online-card-manage").addEventListener("click", () => btn.click());
+  })();
+
+  // The bot's last move in numbers, right under the board.  On a phone the
+  // panel that holds "About the bot" is a long scroll below, so the same rows
+  // are mirrored here as short chips -- whatever the card says, this says.
+  (function () {
+    const details = document.getElementById("details");
+    const strip = document.createElement("div");
+    strip.id = "bot-strip";
+    strip.setAttribute("aria-hidden", "true");      // the card itself is the accessible copy
+    document.querySelector(".board-stage").after(strip);
+    const short = {
+      "simulations, total": v => `<b>${v}</b> sims`,
+      "carried over from your turn": v => `<b>${v}</b> from your turn`,
+      "searched on its turn": v => `<b>${v}</b> on its turn`,
+      "speed on its turn": v => `<b>${v}</b>`,
+      "move from": () => "<b>book move</b>",
+      "exact solver": v => `<b>${v}</b>`,
+      "its own estimate": v => `eval <b>${v}</b>`,
+      "book's estimate": v => `eval <b>${v}</b>`,
+      "depth reached": v => `depth <b>${v}</b>`,
+      "nodes searched": v => `<b>${v}</b> nodes`,
+    };
+    const esc = s => String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+    const update = () => {
+      const rows = [...details.querySelectorAll(".kv")].map(kv => {
+        const [k, v] = [...kv.children].map(x => x.textContent.trim());
+        const f = short[k];
+        return `<span class="bchip">${f ? f(esc(v)) : `${esc(k)} <b>${esc(v)}</b>`}</span>`;
+      });
+      strip.innerHTML = rows.length ? '<span class="bchip head">Bot’s last move</span>' + rows.join("") : "";
+      strip.classList.toggle("on", rows.length > 0);
+    };
+    new MutationObserver(update).observe(details, { childList: true, subtree: true, characterData: true });
+    update();
+  })();
+</script>

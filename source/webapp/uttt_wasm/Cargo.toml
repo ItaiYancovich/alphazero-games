@@ -1,0 +1,19 @@
+[package]
+name = "uttt_wasm"
+version = "0.1.0"
+edition = "2021"
+description = "The native Ultimate Tic-Tac-Toe core (uttt_rs), for the browser"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# The same core the desktop extension is built from, without its Python layer.
+uttt_rs = { path = "../../uttt_rs", default-features = false }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = false

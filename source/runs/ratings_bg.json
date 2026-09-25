@@ -1,0 +1,72 @@
+{
+  "game": "bg",
+  "anchor": "random",
+  "anchor_rating": 1000.0,
+  "board_size": "standard",
+  "games_per_pair": 80,
+  "n_games": 1200,
+  "first_player_advantage": 16.805814879768334,
+  "generated": "2026-08-25T13:09:50+00:00",
+  "bots": {
+    "net:final@2": {
+      "label": "Network[final] 2-ply",
+      "elo": 2317.9,
+      "err": 44.9,
+      "games": 400,
+      "wins": 279,
+      "equity": 0.91,
+      "win_rate": 0.6975,
+      "sec_per_move": 9.852
+    },
+    "net:final@1": {
+      "label": "Network[final] 1-ply",
+      "elo": 2308.0,
+      "err": 44.9,
+      "games": 400,
+      "wins": 274,
+      "equity": 0.8175,
+      "win_rate": 0.685,
+      "sec_per_move": 0.115
+    },
+    "net@2": {
+      "label": "Network 2-ply",
+      "elo": 2298.2,
+      "err": 44.8,
+      "games": 400,
+      "wins": 269,
+      "equity": 0.885,
+      "win_rate": 0.6725,
+      "sec_per_move": 5.497
+    },
+    "net@1": {
+      "label": "Network 1-ply",
+      "elo": 2278.7,
+      "err": 44.8,
+      "games": 400,
+      "wins": 259,
+      "equity": 0.7625,
+      "win_rate": 0.6475,
+      "sec_per_move": 0.068
+    },
+    "heuristic": {
+      "label": "Heuristic",
+      "elo": 1959.6,
+      "err": 46.4,
+      "games": 400,
+      "wins": 119,
+      "equity": -0.705,
+      "win_rate": 0.2975,
+      "sec_per_move": 0.063
+    },
+    "random": {
+      "label": "Random",
+      "elo": 1000.0,
+      "err": 205.8,
+      "games": 400,
+      "wins": 0,
+      "equity": -2.67,
+      "win_rate": 0.0,
+      "sec_per_move": 0.033
+    }
+  }
+}
