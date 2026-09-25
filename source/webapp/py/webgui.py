@@ -37,7 +37,12 @@ import numpy as np
 _infer = None           # set by the worker: (model, planes) -> list of arrays
 _infer_start = None     # (model, planes) -> wait() -> list of arrays, where the
                         # network can answer while Python goes on (see WebNet.start)
-BACKGROUND = True       # use that when it is there (bench.html turns it off to compare)
+# Whether to use that.  Off: it halves the batches (see ``run_search``), and
+# on a phone, where a network call costs about the same for 5 positions as for
+# 12, twice the calls cost more than hiding the search behind the network
+# saves -- measured on an 8-core Android phone, where the bots got slower.  On
+# a desktop it made Connect Four 1.2x faster and the rest no faster.
+BACKGROUND = False
 _MODELS: dict = {}      # models.json, keyed by model name
 _BY_PATH: dict = {}     # checkpoint path (as the adapters spell it) -> model name
 
@@ -303,6 +308,7 @@ def _adapt_games() -> None:
     if "uttt_v3" in _BY_PATH.values():
         g._v3_evaluator = _v3_evaluator
         _install_v3_agent()
+        _judge_uttt_with_v3()
 
 
 # --------------------------------------------------------- the v3 match bot
@@ -326,13 +332,75 @@ class WebBoardEvaluator:
         self.in_planes = int(_MODELS[name]["cfg"].get("in_planes", 23))
 
     def evaluate_boards(self, boards: np.ndarray):
+        return self._answer(boards, _infer(self.name, self._planes(boards)))
+
+    def evaluate_boards_start(self, boards: np.ndarray):
+        """``evaluate_boards`` in two halves, as ``WebNet.start``."""
+        wait = _infer_start(self.name, self._planes(boards))
+        return lambda: self._answer(boards, wait())
+
+    def _planes(self, boards: np.ndarray) -> np.ndarray:
+        n = len(boards)
+        planes = self.encode(np.asarray(boards).reshape(n, 9, 9), self.in_planes)
+        return np.asarray(planes, dtype=np.float32)
+
+    def _answer(self, boards: np.ndarray, outs):
         from alphazero_uttt.rs_agent import _masked_softmax
 
         n = len(boards)
-        planes = self.encode(np.asarray(boards).reshape(n, 9, 9), self.in_planes)
-        logits, values, qs = _infer(self.name, np.asarray(planes, dtype=np.float32))
+        logits, values, qs = outs
         priors = _masked_softmax(logits.reshape(n, 81), np.asarray(boards).reshape(n, 81))
         return priors, values.reshape(n).astype(np.float32), qs.reshape(n, 81).astype(np.float32)
+
+
+class V3Judge:
+    """The v3 network as the PUCT search's evaluator, for analysis and review.
+
+    The v3 match bot's network is the strongest Ultimate network there is, so
+    it judges positions -- through the same PUCT search as before, which only
+    needs ``evaluate(states) -> (priors, values)``.  Positions go in as the
+    canonical boards both sides share (0 playable, 1 own, 2 opponent, 3 out of
+    reach); values come back for the side to move, as the search wants them.
+    """
+
+    def __init__(self, boards: WebBoardEvaluator):
+        self.boards = boards
+
+    @staticmethod
+    def _canonical(states) -> np.ndarray:
+        return np.stack([s.canonical_board().reshape(-1) for s in states])
+
+    def evaluate(self, states):
+        priors, values, _ = self.boards.evaluate_boards(self._canonical(states))
+        return priors, values
+
+    @property
+    def background(self) -> bool:
+        return BACKGROUND and _infer_start is not None
+
+    def evaluate_start(self, states):
+        wait = self.boards.evaluate_boards_start(self._canonical(states))
+        return lambda: wait()[:2]
+
+
+def _judge_uttt_with_v3() -> None:
+    """Ultimate's analysis and match review on the v3 network.
+
+    ``evaluator`` is what both call, and nothing else: the bots build their
+    own, and which network the ratings belong to (``analysis_checkpoint``) is
+    left as it is.  The page names the judge from ``judge`` in the game's blob.
+    """
+    cls = type(g.GAMES["uttt"])
+    cls.evaluator = lambda self, ckpt, board: V3Judge(_v3_evaluator("", ""))
+    blob = g.game_blob
+
+    def game_blob(adapter):
+        out = blob(adapter)
+        if adapter.key == "uttt":
+            out["judge"] = "the v3 network"
+        return out
+
+    g.game_blob = game_blob
 
 
 def _v3_evaluator(ckpt: str, backend: str):

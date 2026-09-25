@@ -38,22 +38,33 @@ ort.env.wasm.wasmPaths = new URL("./ort/", import.meta.url).href;
 ort.env.wasm.numThreads = self.crossOriginIsolated
   ? Math.max(1, Math.min(4, (navigator.hardwareConcurrency || 2) - 1)) : 1;
 
-async function session(name) {
-  if (!sessions[name]) {
-    const url = new URL("./" + models[name].file, import.meta.url);
-    const bytes = new Uint8Array(await (await fetch(url)).arrayBuffer());
-    sessions[name] = await ort.InferenceSession.create(bytes, {
-      executionProviders: ["wasm"], graphOptimizationLevel: "all",
-    });
-  }
-  return sessions[name];
+// A network with an 8-bit version has two files: `file` (8-bit) and
+// `float_file`.  Which is faster depends on the device, and the engine decides
+// (see `precisionFor` in engine-worker.js); `variant` names the one to run.
+function fileOf(name, variant) {
+  const m = models[name];
+  return variant === "float" && m.float_file ? m.float_file : m.file;
 }
 
-async function run({ id, model, dims, n, chunk }) {
+function session(name, variant) {
+  const key = `${name}:${fileOf(name, variant)}`;
+  if (!sessions[key]) {
+    sessions[key] = (async () => {
+      const url = new URL("./" + fileOf(name, variant), import.meta.url);
+      const bytes = new Uint8Array(await (await fetch(url)).arrayBuffer());
+      return ort.InferenceSession.create(bytes, {
+        executionProviders: ["wasm"], graphOptimizationLevel: "all",
+      });
+    })();
+  }
+  return sessions[key];
+}
+
+async function run({ id, model, variant, dims, n, chunk }) {
   const row = dims.slice(1).reduce((a, b) => a * b, 1);
   let answered = 0;
   try {
-    const s = await session(model);
+    const s = await session(model, variant);
     const names = models[model].outputs;
     for (;;) {
       if (Atomics.load(job, 0) !== id) break;           // given up on by the engine
@@ -108,7 +119,9 @@ self.onmessage = async ({ data: msg }) => {
     // the first move.  The rest of the pool loads a model when it is first
     // asked for it: most visits play one or two games, and every model in
     // every worker would cost a phone well over a hundred megabytes a worker.
-    Promise.all(msg.lazy ? [] : Object.keys(models).map(session))
+    const all = Object.keys(models).flatMap(name =>
+      models[name].float_file ? [session(name, "int8"), session(name, "float")] : [session(name)]);
+    Promise.all(msg.lazy ? [] : all)
       .then(() => self.postMessage({ type: "models-ready" }))
       .catch(err => self.postMessage({ type: "error", message: String(err) }));
     self.postMessage({ type: "ready" });

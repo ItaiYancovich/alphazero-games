@@ -10,6 +10,7 @@ importScripts("pyodide/pyodide.js");
 const CTL_INTS = 64, ROWS = CTL_INTS - 1;
 let jobBlock = null, input = null, output = null;
 let slots = [];            // one per network worker: {ctl, port, warm}
+let netMeta = {};          // models.json
 let py = null, web = null;
 const queue = [];
 let busy = false;
@@ -48,7 +49,7 @@ let jobs = 0;
 // always ran -- or "4x2": four of the pool, the batch cut into two pieces a
 // worker (more pieces let a worker on a fast core take more of them).
 // Hand a batch to the network workers; returns the job, for `end`.
-function begin(choice, model, flat, dims) {
+function begin(choice, model, flat, dims, variant = precisionFor(model) || "float") {
   const n = dims[0];
   if (whole.has(model)) choice = "old";
   const [k, per] = choice === "old" ? [0, 1] : choice.split("x").map(Number);
@@ -62,16 +63,16 @@ function begin(choice, model, flat, dims) {
   for (const slot of team) {
     Atomics.store(slot.ctl, 0, 1);
     slot.ctl[ROWS] = 0;
-    slot.port.postMessage({ id, model, dims: Array.from(dims), n, chunk });
+    slot.port.postMessage({ id, model, variant, dims: Array.from(dims), n, chunk });
   }
-  return { choice, model, flat, dims, k, team, t0: performance.now(), waited: false, ms: 0 };
+  return { choice, model, variant, flat, dims, k, team, t0: performance.now(), waited: false, ms: 0 };
 }
 
 // Wait for a job's answers.  `job.waited` says whether there was anything to
 // wait for -- whether the network, not the search, was the slower -- and
 // `job.ms` how long the network took, when that is known.
 function end(job) {
-  const { model, flat, dims, k, team } = job;
+  const { model, variant, flat, dims, k, team } = job;
   const n = dims[0];
   job.waited = team.some(slot => Atomics.load(slot.ctl, 0) === 1);
   // Hear from every worker, even after a failure, so each is idle again.
@@ -87,12 +88,12 @@ function end(job) {
     slots.length = at;
     setTuning(null);
     for (const key of Object.keys(learned)) delete learned[key];
-    return end(begin("old", model, flat, dims));
+    return end(begin("old", model, flat, dims, variant));
   }
   if (states.includes(4)) {
     // Its outputs do not lead with the batch: run it in one piece from now on.
     whole.add(model);
-    return end(begin("old", model, flat, dims));
+    return end(begin("old", model, flat, dims, variant));
   }
   // The shapes, from any worker that answered; the batch is all of them.
   const from = team.find(s => s.ctl[ROWS] > 0);
@@ -122,7 +123,7 @@ function end(job) {
 // is never slower than the site was.  Now and then the runners-up are timed
 // again, since a phone slows down as it heats up.  The page keeps what was
 // learned for the next visit.
-const TUNING_VERSION = 3;
+const TUNING_VERSION = 4;
 const SAMPLES = 5;         // calls to time a choice on before judging it
 const MARGIN = 0.97;       // how much faster a choice must be to take over the best
 const RECHECK = 25;        // calls between second looks at a runner-up
@@ -148,6 +149,7 @@ function setTuning(saved) {
   // on slow cores.
   choices = ["old", ...sizes.map(k => `${k}x1`), ...sizes.filter(k => k >= 4).map(k => `${k}x2`)];
   if (!saved || saved.version !== TUNING_VERSION || saved.workers !== pool) return;
+  Object.assign(precision, saved.precision || {});
   for (const [key, { best, ms }] of Object.entries(saved.learned || {})) {
     if (!choices.includes(best)) continue;
     const L = learned[key] = entry();
@@ -226,7 +228,7 @@ function tuningNow() {
       ms: Object.fromEntries(timed.map(c => [c, +typical(L.times[c]).toFixed(3)])),
     };
   }
-  return { version: TUNING_VERSION, workers: slots.length - 1, learned: out };
+  return { version: TUNING_VERSION, workers: slots.length - 1, precision, learned: out };
 }
 
 const counters = { calls: 0, rows: 0, ms: 0, waitedMs: 0 };    // read by bench.html
@@ -240,9 +242,10 @@ let pending = null;
 
 function inferStart(model, flat, dims) {
   if (pending) throw new Error("a batch is already with the network");
+  if (precisionFor(model) === null) choosePrecision(model, flat, dims);
   const { choice, key } = choiceFor(model, dims[0]);
   // A worker's first calls on a network load it: not a time to learn from.
-  const cold = teamOf(choice, dims[0]).some(s => (s.warm[model] || 0) < WARMUP);
+  const cold = teamOf(choice, dims[0]).some(s => (s.warm[`${model}:${precisionFor(model)}`] || 0) < WARMUP);
   pending = { job: begin(choice, model, flat, dims), key, cold };
 }
 
@@ -250,7 +253,8 @@ function inferFinish() {
   const { job, key, cold } = pending;
   pending = null;
   const outs = end(job);
-  job.team.forEach(s => { s.warm[job.model] = (s.warm[job.model] || 0) + 1; });
+  const warm = `${job.model}:${job.variant}`;
+  job.team.forEach(s => { s.warm[warm] = (s.warm[warm] || 0) + 1; });
   // Only a batch the search had to wait for says how long the network takes.
   if (key && !cold && job.waited) record(key, job.choice, job.ms, job.dims[0]);
   counters.calls++;
@@ -263,6 +267,33 @@ function inferFinish() {
 function inferSync(model, flat, dims) {
   inferStart(model, flat, dims);
   return inferFinish();
+}
+
+// ------------------------------------------------------------ precision
+// Hex, Connect Four and Ultimate have an 8-bit version of their network
+// (models.json: `file`, with the float one as `float_file`).  On a desktop the
+// 8-bit one is about 1.6x faster; on some phones it is slower.  So each device
+// times both, on the first batch the bots ask that network for -- a few runs
+// of each in turns, on the first worker alone -- and keeps the faster.
+const precision = {};      // model -> "int8" | "float", on this device
+
+function precisionFor(model) {
+  const meta = netMeta[model];
+  if (!meta || !meta.float_file) return "float";
+  return precision[model] || null;
+}
+
+function choosePrecision(model, flat, dims) {
+  const times = { float: [], int8: [] };
+  for (let round = 0; round < 4; round++) {
+    for (const variant of ["float", "int8"]) {
+      const job = begin("old", model, flat, dims, variant);
+      end(job);
+      if (round > 0) times[variant].push(job.ms);       // the first loads and settles
+    }
+  }
+  precision[model] = typical(times.int8) < typical(times.float) ? "int8" : "float";
+  self.postMessage({ type: "tuning", tuning: tuningNow() });
 }
 
 function teamOf(choice, rows) {
@@ -323,6 +354,7 @@ async function loadUttt() {
 
 async function boot(msg) {
   const { sab, layout } = msg;
+  netMeta = msg.models;
   jobBlock = new Int32Array(sab, layout.job, 16);
   input = new Float32Array(sab, layout.input, layout.inputFloats);
   output = new Float32Array(sab, layout.output, layout.outputFloats);

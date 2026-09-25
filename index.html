@@ -5641,7 +5641,7 @@ function applyEvalCard() {
   show('eval-visits-head', tree);
   show('eval-share-head', tree);
   show('eval-depth-head', tree);
-  const judge = (gameMeta.analysis_ckpt || '').replace(/\.pt$/, '');
+  const judge = gameMeta.judge || (gameMeta.analysis_ckpt || '').replace(/\.pt$/, '');
   el('eval-off').textContent = gameMeta.key === 'bg'
     ? `Scores every move this roll allows, in points per game. Judged by ${judge}, `
       + 'whoever you are playing.'

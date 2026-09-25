@@ -9,7 +9,8 @@ has build outputs.
 |---|---|
 | Game server and all game logic (runs in Pyodide) | `game_gui.py`, `alphazero_*/` |
 | PUCT search (Hex, Connect Four, UTTT "az" bots, analysis) | `alphazero_core/mcts.py`, `alphazero_core/agents.py`, `alphazero_core/evaluator.py` |
-| Search beside the network (web only) | `run_search` in `alphazero_core/mcts.py`; `evaluate_start` in the evaluators; `WebNet.start` in `webgui.py` |
+| Search beside the network (web only, off: `BACKGROUND` in `webgui.py`) | `run_search` in `alphazero_core/mcts.py`; `evaluate_start` in the evaluators; `WebNet.start` in `webgui.py` |
+| UTTT analysis and review on the v3 network (web only) | `V3Judge`, `_judge_uttt_with_v3` in `webapp/py/webgui.py` |
 | Evaluation cache | `EvalCache` in `webapp/py/webgui.py` |
 | 8-bit networks | `webapp/quantize.py` -> `models/*_int8.onnx` |
 | UTTT v3 match bot | `alphazero_uttt/rs_agent.py`, Rust core in `uttt_rs/` |
@@ -57,9 +58,13 @@ not in this repo, so don't run `build.py --models`. To change a network here
 adjust its entry in `models/models.json`. If a new checkpoint name is used,
 also update `PLACEMENTS` in `build.py` and rebuild so `engine.json` matches.
 
-**8-bit networks:** Hex, Connect Four and UTTT (the "az" bots) run 8-bit
+**8-bit networks:** Hex, Connect Four and UTTT (the "az" bots) have 8-bit
 versions: `models/<name>_int8.onnx`, with the float file kept as `float_file`
-in `models.json` (bench.html's "before" runs it). Only the residual tower is
+in `models.json` (bench.html's "before" runs it). Which one runs is decided
+per device: the first batch a network is asked for is timed both ways on the
+first worker, and the faster is kept with the rest of the tuning
+(`precisionFor` in `engine-worker.js`). On a desktop the 8-bit one wins by
+about 1.6x; on an 8-core Android phone it did not. Only the residual tower is
 8-bit; the stem and heads stay float. `webapp/quantize.py` makes them
 (`pip install onnxruntime onnx`), calibrating on positions from bot games and
 reporting how closely the result follows the float network. The shipped
