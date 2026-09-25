@@ -53,9 +53,9 @@
 <main>
   <h1>Speed test</h1>
   <p>Times the bots on this device, each playing the rule-based bot as it would play you,
-     in two setups: <b>before</b> (the site as it was: one network worker) and <b>after</b>
-     (a pool of network workers tuned to this device, an evaluation cache, and the search
-     running beside the network). They run after–before–before–after, so a phone that slows
+     in two setups: <b>before</b> (the site as it was: one network worker, full-precision
+     networks) and <b>after</b> (a pool of network workers tuned to this device, 8-bit or
+     full-precision networks, whichever this device runs faster, and an evaluation cache). They run after–before–before–after, so a phone that slows
      down as it warms up is fair to both.</p>
   <p>Takes about 3–6 minutes. Keep this tab in front and the screen on; plugged in and
      not in low-power mode is best.</p>
@@ -98,14 +98,14 @@ const CASES = [
   ["uttt", "v3:2", 0, 28, "", "UTTT v3 bot"],
 ];
 
-// FAST says which setup: the evaluation cache and the search running beside
-// the network, or neither (the site as it was, with "before"'s one worker).
+// FAST says which setup: with the evaluation cache, or without it (the site
+// as it was, with "before"'s one worker and float networks).
 const PY = `
 import json, time, js
 import webgui as W
 S = W.SESSION
 S.set_pace(0.0)
-W.CACHE.enabled = W.BACKGROUND = FAST
+W.CACHE.enabled = FAST
 def stats():
     s = js.inferStats
     return s.calls, s.rows, s.waitedMs, W.CACHE.hits
@@ -251,8 +251,10 @@ function render() {
   if (tuned) {
     const picks = Object.entries(tuned.learned || {})
       .map(([key, v]) => `${key.replace("|", " ")}+ → ${v.best}`).join(", ");
+    const bits = Object.entries(tuned.precision || {}).map(([m, p]) => `${m} ${p}`).join(", ");
     $("tuned").textContent = `This device reports ${device.cores} cores; the pool has `
-      + `${tuned.workers} network workers. Learned spreads: ${picks || "none yet"}.`;
+      + `${tuned.workers} network workers. Networks: ${bits || "not chosen yet"}. `
+      + `Learned spreads: ${picks || "none yet"}.`;
   }
   $("raw").value = JSON.stringify({ device, tuned, results }, null, 1);
   $("raw-card").hidden = false;
