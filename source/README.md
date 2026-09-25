@@ -9,6 +9,9 @@ has build outputs.
 |---|---|
 | Game server and all game logic (runs in Pyodide) | `game_gui.py`, `alphazero_*/` |
 | PUCT search (Hex, Connect Four, UTTT "az" bots, analysis) | `alphazero_core/mcts.py`, `alphazero_core/agents.py`, `alphazero_core/evaluator.py` |
+| Search beside the network (web only) | `run_search` in `alphazero_core/mcts.py`; `evaluate_start` in the evaluators; `WebNet.start` in `webgui.py` |
+| Evaluation cache | `EvalCache` in `webapp/py/webgui.py` |
+| 8-bit networks | `webapp/quantize.py` -> `models/*_int8.onnx` |
 | UTTT v3 match bot | `alphazero_uttt/rs_agent.py`, Rust core in `uttt_rs/` |
 | Web layer: loaders, v3 agent without threads, session stepping | `webapp/py/webgui.py` (see `WebPonderingAgent.run`, `ponder_tick`) |
 | `uttt_rs` for the browser (WASM wrapper + Python shim) | `webapp/uttt_wasm/`, `webapp/py/alphazero_uttt/uttt_rs.py` |
@@ -54,6 +57,19 @@ not in this repo, so don't run `build.py --models`. To change a network here
 adjust its entry in `models/models.json`. If a new checkpoint name is used,
 also update `PLACEMENTS` in `build.py` and rebuild so `engine.json` matches.
 
+**8-bit networks:** Hex, Connect Four and UTTT (the "az" bots) run 8-bit
+versions: `models/<name>_int8.onnx`, with the float file kept as `float_file`
+in `models.json` (bench.html's "before" runs it). Only the residual tower is
+8-bit; the stem and heads stay float. `webapp/quantize.py` makes them
+(`pip install onnxruntime onnx`), calibrating on positions from bot games and
+reporting how closely the result follows the float network. The shipped
+files were made the same way (from a separate calibration run) and each
+scored 50-53% in 24-40 game matches against the float network at 400
+simulations. Intransitive's value head lost too much, and the v3 and
+Splendor networks are not convolutional towers, so those stay float. A
+re-export from the main project (`export_onnx.py`) writes a fresh
+`models.json`; run `quantize.py` again after it.
+
 ## Test
 
 ```bash
@@ -66,4 +82,12 @@ onnxruntime-web against the built site. `parity.mjs` checks the WASM
 Locally, `python source/webapp/serve.py` serves the site with the
 cross-origin isolation headers on port 8765.
 
-On a real device, `bench.html` times the bots.
+On a real device, `bench.html` times the bots: each plays the rule-based bot,
+before (the old site: one network worker, float networks, no cache, one batch
+at a time) and after, alternating after-before-before-after.
+
+Two things in `build.py` to know: text outputs are written with CRLF on every
+system, so builds match wherever they run; and when `node_modules` exists in
+`webapp/dev` (after `npm install` for the tests), the vendored runtimes are
+copied from it -- if that is not an upgrade you meant, `git checkout pyodide
+ort nostr.bundle.js` afterwards.
