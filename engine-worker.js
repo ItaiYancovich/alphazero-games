@@ -47,7 +47,8 @@ let jobs = 0;
 // `choice` is "old" -- the first worker alone, on its own threads, as the site
 // always ran -- or "4x2": four of the pool, the batch cut into two pieces a
 // worker (more pieces let a worker on a fast core take more of them).
-function inferOn(choice, model, flat, dims) {
+// Hand a batch to the network workers; returns the job, for `end`.
+function begin(choice, model, flat, dims) {
   const n = dims[0];
   if (whole.has(model)) choice = "old";
   const [k, per] = choice === "old" ? [0, 1] : choice.split("x").map(Number);
@@ -63,8 +64,19 @@ function inferOn(choice, model, flat, dims) {
     slot.ctl[ROWS] = 0;
     slot.port.postMessage({ id, model, dims: Array.from(dims), n, chunk });
   }
+  return { choice, model, flat, dims, k, team, t0: performance.now(), waited: false, ms: 0 };
+}
+
+// Wait for a job's answers.  `job.waited` says whether there was anything to
+// wait for -- whether the network, not the search, was the slower -- and
+// `job.ms` how long the network took, when that is known.
+function end(job) {
+  const { model, flat, dims, k, team } = job;
+  const n = dims[0];
+  job.waited = team.some(slot => Atomics.load(slot.ctl, 0) === 1);
   // Hear from every worker, even after a failure, so each is idle again.
   const states = team.map(slot => finished(slot, slot === slots[0]));
+  job.ms = performance.now() - job.t0;
   Atomics.store(jobBlock, 0, 0);            // anyone still at it: stop
   const lost = states.indexOf(3);
   if (lost >= 0 && team[lost] === slots[0]) throw new Error("the network failed");
@@ -75,12 +87,12 @@ function inferOn(choice, model, flat, dims) {
     slots.length = at;
     setTuning(null);
     for (const key of Object.keys(learned)) delete learned[key];
-    return inferOn("old", model, flat, dims);
+    return end(begin("old", model, flat, dims));
   }
   if (states.includes(4)) {
     // Its outputs do not lead with the batch: run it in one piece from now on.
     whole.add(model);
-    return inferOn("old", model, flat, dims);
+    return end(begin("old", model, flat, dims));
   }
   // The shapes, from any worker that answered; the batch is all of them.
   const from = team.find(s => s.ctl[ROWS] > 0);
@@ -217,24 +229,45 @@ function tuningNow() {
   return { version: TUNING_VERSION, workers: slots.length - 1, learned: out };
 }
 
-const counters = { calls: 0, rows: 0, ms: 0 };    // read by bench.html
+const counters = { calls: 0, rows: 0, ms: 0, waitedMs: 0 };    // read by bench.html
 self.inferStats = counters;
 
-function inferSync(model, flat, dims) {
+// The engine's two ways to call the network.  `inferSync` answers at once.
+// `inferStart` hands the batch over and returns, and `inferFinish` waits for
+// its answer, so the search can collect its next batch in between (see
+// `run_search` in alphazero_core/mcts.py) -- one batch in flight at a time.
+let pending = null;
+
+function inferStart(model, flat, dims) {
+  if (pending) throw new Error("a batch is already with the network");
   const { choice, key } = choiceFor(model, dims[0]);
   // A worker's first calls on a network load it: not a time to learn from.
-  const k = choice === "old" ? 0 : parseInt(choice, 10);
-  const used = k === 0 ? [slots[0]] : slots.slice(1, 1 + Math.min(k, dims[0]));
-  const cold = used.some(s => (s.warm[model] || 0) < WARMUP);
-  const t0 = performance.now();
-  const outs = inferOn(choice, model, flat, dims);
-  const ms = performance.now() - t0;
-  used.forEach(s => { s.warm[model] = (s.warm[model] || 0) + 1; });
-  if (key && !cold) record(key, choice, ms, dims[0]);
+  const cold = teamOf(choice, dims[0]).some(s => (s.warm[model] || 0) < WARMUP);
+  pending = { job: begin(choice, model, flat, dims), key, cold };
+}
+
+function inferFinish() {
+  const { job, key, cold } = pending;
+  pending = null;
+  const outs = end(job);
+  job.team.forEach(s => { s.warm[job.model] = (s.warm[job.model] || 0) + 1; });
+  // Only a batch the search had to wait for says how long the network takes.
+  if (key && !cold && job.waited) record(key, job.choice, job.ms, job.dims[0]);
   counters.calls++;
-  counters.rows += dims[0];
-  counters.ms += ms;
+  counters.rows += job.dims[0];
+  counters.ms += job.ms;
+  if (job.waited) counters.waitedMs += job.ms;
   return outs;
+}
+
+function inferSync(model, flat, dims) {
+  inferStart(model, flat, dims);
+  return inferFinish();
+}
+
+function teamOf(choice, rows) {
+  const k = choice === "old" ? 0 : parseInt(choice, 10);
+  return k === 0 ? [slots[0]] : slots.slice(1, 1 + Math.min(k, rows));
 }
 
 const progress = (stage, detail) => self.postMessage({ type: "progress", stage, detail });
@@ -310,7 +343,7 @@ async function boot(msg) {
   restoreProfiles();
   py.runPython("import sys; sys.path.insert(0, '/proj')");
   web = py.pyimport("webgui");
-  web.set_infer(inferSync);
+  web.set_infer(inferSync, inferStart, inferFinish);
   await core;
   let placements = await (await fetch("engine.json")).text();
   if (!self.utttWasm) {

@@ -75,19 +75,48 @@ class MCTSConfig:
 
 
 BATCH = 24  # leaves per network call, as in self-play
+BACKGROUND_SPLIT = 2  # see run_search
 
 
 def run_search(search: "Search", engine, target: int, batch: int = BATCH) -> None:
     """Grow a tree until it has ``target`` simulations behind it.
 
     ``engine`` is anything with the evaluator's ``evaluate(states)`` signature.
+
+    An engine whose network can answer in the background (``engine.background``
+    -- the web build's, where the network runs in other workers) is kept busy:
+    the next batch of leaves is collected while the network works on the last
+    one, and the last one's answers are backed up while it works on the next,
+    so the search's own time hides behind the network's.  The price is a
+    second batch in flight, collected without the first one's answers -- as
+    engines that search on several threads do.  Every other engine runs one
+    batch at a time, exactly as before.
     """
-    while search.sims_done < target:
-        states = search.next_leaf_batch(batch)
-        if not states:
+    if not getattr(engine, "background", False):
+        while search.sims_done < target:
+            states = search.next_leaf_batch(batch)
+            if not states:
+                break
+            priors, values = engine.evaluate(states)
+            search.expand_batch(priors, values)
+        return
+    # Two batches of half the size, so the leaves in flight -- and the virtual
+    # loss steering the search away from them -- are as many as before.
+    half = max(1, batch // BACKGROUND_SPLIT)
+    ahead = None  # (leaves, wait): the batch the network is working on
+    while True:
+        busy = ahead[0] if ahead is not None else ()
+        leaves = search.collect_leaves(half, busy) if search.sims_done < target else []
+        answer = ahead[1]() if ahead is not None else None
+        wait = engine.evaluate_start([leaf[2] for leaf in leaves]) if leaves else None
+        if ahead is not None:
+            search.apply_leaves(ahead[0], *answer)
+        if leaves:
+            ahead = (leaves, wait)
+        elif ahead is not None:
+            ahead = None  # nothing new (a collision, or the budget): look again
+        else:
             break
-        priors, values = engine.evaluate(states)
-        search.expand_batch(priors, values)
 
 
 class Search:
@@ -237,12 +266,24 @@ class Search:
         The loss is undone in :meth:`expand_batch`.  This is what lets a single
         game batch its network calls -- a batch of one wastes most of a CPU.
         """
-        self._batch = []
-        pending_nodes: set[int] = set()
+        self._batch = self.collect_leaves(max_leaves)
+        return [b[2] for b in self._batch]
+
+    def collect_leaves(self, max_leaves: int, busy=()) -> list:
+        """:meth:`next_leaf_batch` for a caller that keeps the batch itself.
+
+        Returns ``(path, node, state)`` for each leaf, to hand back to
+        :meth:`apply_leaves`.  ``busy`` is a batch still waiting for the
+        network: its leaves count against the budget, and reaching one of them
+        again is a collision, as reaching a leaf of this batch twice is.
+        """
+        batch: list[tuple[list, int, GameState]] = []
+        pending_nodes: set[int] = {leaf[1] for leaf in busy}
+        in_flight = len(busy)
         vl = 1.0
         while (
-            len(self._batch) < max_leaves
-            and self.sims_done + len(self._batch) < self.budget
+            len(batch) < max_leaves
+            and self.sims_done + in_flight + len(batch) < self.budget
         ):
             state = self.root_state.copy()
             path: list[tuple[int, int]] = []
@@ -283,17 +324,21 @@ class Search:
                 break
             pending_nodes.add(node)
             self._note_depth(path)
-            self._batch.append((path, node, state))
-        return [b[2] for b in self._batch]
+            batch.append((path, node, state))
+        return batch
 
     def expand_batch(self, priors: np.ndarray, values: np.ndarray) -> None:
-        for i, (path, node, state) in enumerate(self._batch):
+        self.apply_leaves(self._batch, priors, values)
+        self._batch = []
+
+    def apply_leaves(self, batch: list, priors: np.ndarray, values: np.ndarray) -> None:
+        """Expand a batch from :meth:`collect_leaves` with the network's answers."""
+        for i, (path, node, state) in enumerate(batch):
             self._undo_virtual_loss(path, 1.0)
             self._pending_path = path
             self._pending_state = state
             self._pending_node = node
             self.expand(node, priors[i], float(values[i]))
-        self._batch = []
 
     def _undo_virtual_loss(self, path, vl: float) -> None:
         for node, a in path:

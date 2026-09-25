@@ -46,7 +46,14 @@ class SwapAwareEvaluator:
         self.swap_prior = float(swap_prior)
 
     def evaluate(self, states) -> tuple[np.ndarray, np.ndarray]:
-        priors, values = self.inner.evaluate(states)
+        return self._with_swap(states, *self.inner.evaluate(states))
+
+    def evaluate_start(self, states):
+        """The inner evaluator's ``evaluate_start``, answers widened as above."""
+        wait = self.inner.evaluate_start(states)
+        return lambda: self._with_swap(states, *wait())
+
+    def _with_swap(self, states, priors, values) -> tuple[np.ndarray, np.ndarray]:
         b, cells = priors.shape
         out = np.zeros((b, cells + 1), dtype=np.float32)
         out[:, :cells] = priors

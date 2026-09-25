@@ -85,7 +85,8 @@ def build_placements() -> None:
     models = json.loads((SITE / "models" / "models.json").read_text())
     placements = {name: PLACEMENTS[name].format(ckpt=meta["ckpt"])
                   for name, meta in models.items()}
-    (SITE / "engine.json").write_text(json.dumps(placements, indent=1))
+    # CRLF on every system, so a build on Linux matches one on Windows.
+    (SITE / "engine.json").write_text(json.dumps(placements, indent=1), newline="\r\n")
 
 
 def build_page() -> None:
@@ -107,7 +108,7 @@ def build_page() -> None:
     src = src.replace("</head>", extra + "</head>", 1)
     body_extra = (WEBAPP / "static" / "body.html").read_text(encoding="utf-8")
     src = src.replace("</body>", body_extra + "</body>", 1)
-    (SITE / "index.html").write_text(src, encoding="utf-8")
+    (SITE / "index.html").write_text(src.replace("\r\n", "\n"), encoding="utf-8", newline="\r\n")
     for path in (WEBAPP / "static").iterdir():
         if path.suffix in (".js", ".css", ".svg", ".png", ".webmanifest", ".json") \
                 or path.name == "bench.html":
@@ -161,8 +162,12 @@ def build_wasm() -> None:
     wasm = WASM_CRATE / "target" / "wasm32-wasip1" / "release" / "uttt_wasm.wasm"
     cargo = shutil.which("cargo")
     if cargo:
-        subprocess.run([cargo, "build", "--release", "--target", "wasm32-wasip1"],
-                       cwd=WASM_CRATE, check=True, capture_output=True)
+        built = subprocess.run([cargo, "build", "--release", "--target", "wasm32-wasip1"],
+                               cwd=WASM_CRATE, capture_output=True, text=True)
+        if built.returncode != 0:
+            # Most often the target is missing; the wasm already in the site stays.
+            print("uttt_wasm   not built:", (built.stderr.strip().splitlines() or ["?"])[-1])
+            return
     if not wasm.exists():
         print("uttt_wasm   not built (needs cargo + `rustup target add wasm32-wasip1`)")
         return

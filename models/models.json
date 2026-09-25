@@ -1,6 +1,6 @@
 {
  "hex": {
-  "file": "models/hex.onnx",
+  "file": "models/hex_int8.onnx",
   "input_shape": [
    10,
    11,
@@ -23,10 +23,17 @@
    "ply_head": false,
    "policy_planes": 1
   },
-  "ckpt": "v2_final.pt"
+  "ckpt": "v2_final.pt",
+  "float_file": "models/hex.onnx",
+  "int8": {
+   "top_move_same": 0.976,
+   "value_diff_mean": 0.0244,
+   "value_diff_max": 0.3521,
+   "positions": 1000
+  }
  },
  "c4": {
-  "file": "models/c4.onnx",
+  "file": "models/c4_int8.onnx",
   "input_shape": [
    3,
    6,
@@ -49,10 +56,17 @@
    "ply_head": false,
    "policy_planes": 1
   },
-  "ckpt": "final.pt"
+  "ckpt": "final.pt",
+  "float_file": "models/c4.onnx",
+  "int8": {
+   "top_move_same": 0.982,
+   "value_diff_mean": 0.0172,
+   "value_diff_max": 0.1234,
+   "positions": 1000
+  }
  },
  "uttt": {
-  "file": "models/uttt.onnx",
+  "file": "models/uttt_int8.onnx",
   "input_shape": [
    23,
    9,
@@ -75,7 +89,14 @@
    "ply_head": false,
    "policy_planes": 1
   },
-  "ckpt": "final.pt"
+  "ckpt": "final.pt",
+  "float_file": "models/uttt.onnx",
+  "int8": {
+   "top_move_same": 0.989,
+   "value_diff_mean": 0.0085,
+   "value_diff_max": 0.0638,
+   "positions": 1000
+  }
  },
  "rps2": {
   "file": "models/rps2.onnx",
