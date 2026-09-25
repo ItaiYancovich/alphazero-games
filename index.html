@@ -1031,6 +1031,21 @@
     justify-content: center; background: rgba(0, 0, 0, .32); padding: 24px;
   }
   #boot-overlay-lost[hidden] { display: none; }
+
+  /* The bot's last move in numbers, under the board -- where the side panel
+     is not beside it (a phone, or the slide-over panel). */
+  #bot-strip { display: none; }
+  body.mode-stack #bot-strip.on, body.mode-drawer #bot-strip.on {
+    display: flex; flex-wrap: wrap; justify-content: center; gap: 6px; margin-top: 10px;
+  }
+  body.online #bot-strip { display: none !important; }
+  #bot-strip .bchip {
+    font-size: 12.5px; line-height: 1.3; padding: 5px 10px; border-radius: 12px;
+    background: var(--md-surface-2); color: var(--dim); white-space: nowrap;
+  }
+  #bot-strip .bchip b { color: var(--ink); font-weight: 500; font-variant-numeric: tabular-nums; }
+  #bot-strip .bchip.head { background: var(--md-secondary-container);
+                           color: var(--md-on-secondary-container); font-weight: 500; }
   @media (max-width: 899px) {
     #online-btn .lbl { display: none; }
     #online-btn { padding: 0 12px; }
@@ -5917,6 +5932,41 @@ async function boot() {
     const card = document.getElementById("online-card-tpl").content.cloneNode(true);
     document.getElementById("panel-play").prepend(card);
     document.getElementById("online-card-manage").addEventListener("click", () => btn.click());
+  })();
+
+  // The bot's last move in numbers, right under the board.  On a phone the
+  // panel that holds "About the bot" is a long scroll below, so the same rows
+  // are mirrored here as short chips -- whatever the card says, this says.
+  (function () {
+    const details = document.getElementById("details");
+    const strip = document.createElement("div");
+    strip.id = "bot-strip";
+    strip.setAttribute("aria-hidden", "true");      // the card itself is the accessible copy
+    document.querySelector(".board-stage").after(strip);
+    const short = {
+      "simulations, total": v => `<b>${v}</b> sims`,
+      "carried over from your turn": v => `<b>${v}</b> from your turn`,
+      "searched on its turn": v => `<b>${v}</b> on its turn`,
+      "speed on its turn": v => `<b>${v}</b>`,
+      "move from": () => "<b>book move</b>",
+      "exact solver": v => `<b>${v}</b>`,
+      "its own estimate": v => `eval <b>${v}</b>`,
+      "book's estimate": v => `eval <b>${v}</b>`,
+      "depth reached": v => `depth <b>${v}</b>`,
+      "nodes searched": v => `<b>${v}</b> nodes`,
+    };
+    const esc = s => String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+    const update = () => {
+      const rows = [...details.querySelectorAll(".kv")].map(kv => {
+        const [k, v] = [...kv.children].map(x => x.textContent.trim());
+        const f = short[k];
+        return `<span class="bchip">${f ? f(esc(v)) : `${esc(k)} <b>${esc(v)}</b>`}</span>`;
+      });
+      strip.innerHTML = rows.length ? '<span class="bchip head">Bot’s last move</span>' + rows.join("") : "";
+      strip.classList.toggle("on", rows.length > 0);
+    };
+    new MutationObserver(update).observe(details, { childList: true, subtree: true, characterData: true });
+    update();
   })();
 </script>
 </body>

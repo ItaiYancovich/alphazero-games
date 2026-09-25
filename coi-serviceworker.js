@@ -15,11 +15,30 @@ if (typeof window === "undefined") {
   const COEP = new URL(self.location).searchParams.get("coep") || "require-corp";
   self.addEventListener("install", () => self.skipWaiting());
   self.addEventListener("activate", event => event.waitUntil(self.clients.claim()));
+  // The big runtimes never change under the same name; everything else (the
+  // page, the engine, the networks) can change with any update, and GitHub
+  // Pages tells browsers to keep a copy for ten minutes -- long enough that a
+  // phone shows yesterday's site right after an update.  So those are always
+  // revalidated: a cheap "not modified" when nothing changed, the new file
+  // when something did.
+  const STABLE = /\/(pyodide|ort)\//;
+  const fresh = req => {
+    const url = new URL(req.url);
+    if (req.method !== "GET" || url.origin !== self.location.origin || STABLE.test(url.pathname)) {
+      return fetch(req);
+    }
+    if (req.mode === "navigate") {
+      return fetch(req.url, { cache: "no-cache", credentials: "same-origin" }).then(res =>
+        res.redirected ? Response.redirect(res.url, 302) : res);
+    }
+    return fetch(new Request(req, { cache: "no-cache" }));
+  };
   self.addEventListener("fetch", event => {
     const req = event.request;
     if (req.cache === "only-if-cached" && req.mode !== "same-origin") return;
     event.respondWith((async () => {
-      const res = await fetch(req);
+      const res = await fresh(req);
+      if (res.type === "opaqueredirect" || res.status === 302) return res;
       if (res.status === 0) return res;             // opaque: pass through untouched
       const headers = new Headers(res.headers);
       headers.set("Cross-Origin-Embedder-Policy", COEP);
