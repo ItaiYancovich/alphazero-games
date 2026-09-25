@@ -57,8 +57,9 @@
      networks) and <b>after</b> (a pool of network workers tuned to this device, 8-bit or
      full-precision networks, whichever this device runs faster, and an evaluation cache). They run after–before–before–after, so a phone that slows
      down as it warms up is fair to both.</p>
-  <p>Takes about 3–6 minutes. Keep this tab in front and the screen on; plugged in and
-     not in low-power mode is best.</p>
+  <p>Takes about 4–7 minutes: first a minute of the bots playing, untimed, so the phone is
+     already as warm as it gets in a real game, then the timed rounds. Keep this tab in
+     front and the screen on; plugged in and not in low-power mode is best.</p>
 
   <div class="card">
     <div class="row">
@@ -141,6 +142,20 @@ def play(key, choice, sims, plies, size):
 json.dumps([play(*c) for c in CASES])
 `;
 
+const WARMUP_PY = `
+import time
+import webgui as W
+S = W.SESSION
+S.set_pace(0.0)
+end = time.perf_counter() + 60
+while time.perf_counter() < end:
+    S.new_game(game="hex", black="az", white="az", size="11", black_sims=400, white_sims=400)
+    while S.bot_pending() and time.perf_counter() < end:
+        S.bot_think()
+        S.bot_commit()
+"done"
+`;
+
 let nextId = 1;
 async function setup(models, workers, tuning) {
   const t0 = performance.now();
@@ -173,6 +188,7 @@ const device = {
   pool: EnginePool.defaultWorkers(),
 };
 let tuned = null;
+let modelMeta = {};
 
 function progress(text, frac) {
   $("status").textContent = text;
@@ -186,12 +202,19 @@ async function start() {
     $("go").disabled = false;
     return;
   }
-  const models = await (await fetch("models/models.json")).json();
+  const models = modelMeta = await (await fetch("models/models.json")).json();
   // "before" runs the networks as they were: full precision.
   const floats = JSON.parse(JSON.stringify(models));
   for (const m of Object.values(floats)) if (m.float_file) m.file = m.float_file;
   const plan = [["after", null], ["before", 1], ["before", 1], ["after", null]];
   try {
+    // A phone slows down as it heats up, and a minute in it is far slower
+    // than when it started: warm it up first, so every timed round runs at
+    // the speed a real game settles at.
+    progress("Warming up: the bots play for a minute, untimed…", 0);
+    const w = await setup(floats, 1, null);
+    await w.run(WARMUP_PY);
+    w.stop();
     for (let i = 0; i < plan.length; i++) {
       const [name, workers] = plan[i];
       progress(`Round ${i + 1} of ${plan.length} (${name}): starting the engine…`, i / plan.length);
@@ -251,7 +274,14 @@ function render() {
   if (tuned) {
     const picks = Object.entries(tuned.learned || {})
       .map(([key, v]) => `${key.replace("|", " ")}+ → ${v.best}`).join(", ");
-    const bits = Object.entries(tuned.precision || {}).map(([m, p]) => `${m} ${p}`).join(", ");
+    const precs = {};
+    for (const [key, v] of Object.entries(tuned.learned || {})) {
+      const model = key.split("|")[0];
+      if (v.prec && (modelMeta[model] || {}).float_file) {
+        (precs[model] = precs[model] || new Set()).add(v.prec === "8" ? "8-bit" : "float");
+      }
+    }
+    const bits = Object.entries(precs).map(([m, s]) => `${m} ${[...s].join("/")}`).join(", ");
     $("tuned").textContent = `This device reports ${device.cores} cores; the pool has `
       + `${tuned.workers} network workers. Networks: ${bits || "not chosen yet"}. `
       + `Learned spreads: ${picks || "none yet"}.`;

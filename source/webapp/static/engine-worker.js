@@ -45,14 +45,21 @@ function finished(slot, patient) {
 const whole = new Set();   // models whose outputs cannot be cut by position
 let jobs = 0;
 
-// `choice` is "old" -- the first worker alone, on its own threads, as the site
-// always ran -- or "4x2": four of the pool, the batch cut into two pieces a
-// worker (more pieces let a worker on a fast core take more of them).
+// `choice` names a setup and a precision: "old:f" -- the first worker alone,
+// on its own threads, the float network: the site as it always ran -- or
+// "4x2:8": four of the pool, the batch cut into two pieces a worker (more
+// pieces let a worker on a fast core take more of them), the 8-bit network.
+function parseChoice(choice) {
+  const [setup, p] = choice.split(":");
+  const [k, per] = setup === "old" ? [0, 1] : setup.split("x").map(Number);
+  return { setup, k, per, variant: p === "8" ? "int8" : "float" };
+}
+
 // Hand a batch to the network workers; returns the job, for `end`.
-function begin(choice, model, flat, dims, variant = precisionFor(model) || "float") {
+function begin(choice, model, flat, dims) {
   const n = dims[0];
-  if (whole.has(model)) choice = "old";
-  const [k, per] = choice === "old" ? [0, 1] : choice.split("x").map(Number);
+  if (whole.has(model)) choice = "old:" + (choice.split(":")[1] || "f");
+  const { k, per, variant } = parseChoice(choice);
   const team = k === 0 ? [slots[0]] : slots.slice(1, 1 + Math.min(k, n));
   if (flat.length > input.length) throw new Error("input too large for the shared buffer");
   input.set(flat, 0);
@@ -88,12 +95,12 @@ function end(job) {
     slots.length = at;
     setTuning(null);
     for (const key of Object.keys(learned)) delete learned[key];
-    return end(begin("old", model, flat, dims, variant));
+    return end(begin(`old:${variant === "int8" ? "8" : "f"}`, model, flat, dims));
   }
   if (states.includes(4)) {
     // Its outputs do not lead with the batch: run it in one piece from now on.
     whole.add(model);
-    return end(begin("old", model, flat, dims, variant));
+    return end(begin(`old:${variant === "int8" ? "8" : "f"}`, model, flat, dims));
   }
   // The shapes, from any worker that answered; the batch is all of them.
   const from = team.find(s => s.ctl[ROWS] > 0);
@@ -116,29 +123,46 @@ function end(job) {
 // ------------------------------------------------------------ the tuning
 // Which way is fastest depends on the device -- how many cores it has, how
 // many of them are fast ones, how hot it is -- and on the network and the
-// size of the batch.  So it is learned from the bots' own calls: for each
-// network and batch size, every choice is timed on a few real batches, taking
-// turns so a device warming up or slowing down is fair to all, and the
-// fastest is used from then on.  "old" is one of the choices, so the result
-// is never slower than the site was.  Now and then the runners-up are timed
-// again, since a phone slows down as it heats up.  The page keeps what was
-// learned for the next visit.
-const TUNING_VERSION = 4;
+// size of the batch.  So it is learned from the bots' own calls, for each
+// network and batch size, in two steps:
+//
+// * Precision, where there is a choice (Hex, Connect Four and Ultimate have an
+//   8-bit network beside the float one): the old setup is timed with each, in
+//   turns.  On a desktop the 8-bit one is about 1.6x faster; on an 8-core
+//   Android phone it was slower.
+// * Then how many workers: every setup at that precision is timed on a few
+//   real batches, taking turns so a device warming up or slowing down is fair
+//   to all, and the fastest is used from then on.  "old:f" -- the site as it
+//   was -- is always one of them, so the result is never slower than that.
+//
+// Now and then a runner-up is timed again, since a phone slows down as it
+// heats up.  The page keeps what was learned for the next visit.
+const TUNING_VERSION = 5;
 const SAMPLES = 5;         // calls to time a choice on before judging it
 const MARGIN = 0.97;       // how much faster a choice must be to take over the best
 const RECHECK = 25;        // calls between second looks at a runner-up
 const WARMUP = 2;          // a worker's first calls on a network load and settle it
-let choices = ["old"];
+let setups = ["old"];      // "old", then the pool's: "2x1", ..., "8x2"
 const learned = {};        // "model|8" -> see `entry`
 
-function entry() {
+const hasInt8 = model => !!(netMeta[model] && netMeta[model].float_file);
+
+// The setups to try at precision `p` ("f" or "8"), with the old float one.
+function spreadChoices(p) {
+  return [...new Set(["old:f", ...setups.map(s => `${s}:${p}`)])];
+}
+
+function entry(model) {
+  const both = hasInt8(model) && setups.length > 1;
   return {
-    best: null,              // the choice in use, once every one has been timed
+    prec: both ? null : "f", // "f" / "8" once chosen; null while comparing
+    candidates: both ? ["old:f", "old:8"] : spreadChoices("f"),
+    best: null,              // the choice in use, once every candidate has been timed
     trying: null,            // a runner-up being timed again, if any
     saved: false,            // told the page
     calls: 0,
     rechecks: 0,
-    times: Object.fromEntries(choices.map(c => [c, []])),   // recent ms per position
+    times: {},               // choice -> recent ms per position
   };
 }
 
@@ -147,15 +171,16 @@ function setTuning(saved) {
   const sizes = [...new Set([2, 3, 4, 6, 8, pool])].filter(k => k <= pool).sort((a, b) => a - b);
   // Two pieces a worker only where there are enough workers for some to be
   // on slow cores.
-  choices = ["old", ...sizes.map(k => `${k}x1`), ...sizes.filter(k => k >= 4).map(k => `${k}x2`)];
+  setups = ["old", ...sizes.map(k => `${k}x1`), ...sizes.filter(k => k >= 4).map(k => `${k}x2`)];
   if (!saved || saved.version !== TUNING_VERSION || saved.workers !== pool) return;
-  Object.assign(precision, saved.precision || {});
-  for (const [key, { best, ms }] of Object.entries(saved.learned || {})) {
-    if (!choices.includes(best)) continue;
-    const L = learned[key] = entry();
+  for (const [key, { best, prec, ms }] of Object.entries(saved.learned || {})) {
+    const L = learned[key] = entry(key.split("|")[0]);
+    L.prec = prec;
+    L.candidates = spreadChoices(prec);
+    if (!L.candidates.includes(best)) { delete learned[key]; continue; }
     L.best = best;
     L.saved = true;
-    for (const c of choices) {
+    for (const c of L.candidates) {
       L.times[c] = Array(SAMPLES).fill(ms[c] != null ? ms[c] : c === best ? 0 : Infinity);
     }
   }
@@ -163,34 +188,38 @@ function setTuning(saved) {
 
 // Batches are compared only with batches of about the same size -- 8 to 15
 // positions with 8 to 15, and so on -- since a small one costs more per
-// position and may be best on fewer workers.  (A PUCT search asks for up to
-// 24 at a time, the v3 bot for 48.)
+// position and may be best on fewer workers.  (A bot's PUCT search asks for
+// up to 16 at a time, match review for 24, the v3 bot for 48.)
 const sizeOf = rows => 2 ** Math.min(6, Math.floor(Math.log2(rows)));
 
 // The typical time of the last few calls: one slow call (the device busy
 // with something else) moves a median less than it moves an average.
 function typical(list) {
-  const s = [...list].sort((a, b) => a - b);
+  const s = [...(list || [])].sort((a, b) => a - b);
   return s.length ? s[Math.floor(s.length / 2)] : Infinity;
 }
 
+const timed = (L, c) => (L.times[c] || []).length;
+
 function choiceFor(model, rows) {
-  if (choices.length < 2 || rows < 2 || whole.has(model)) return { choice: "old" };
+  if (setups.length < 2 || rows < 2 || whole.has(model)) return { choice: "old:f" };
   const key = `${model}|${sizeOf(rows)}`;
-  const L = learned[key] || (learned[key] = entry());
+  const L = learned[key] || (learned[key] = entry(model));
   L.calls++;
   if (L.best === null) {
-    // Every choice in turn, the least timed first.
-    const fewest = Math.min(...choices.map(c => L.times[c].length));
-    const behind = choices.filter(c => L.times[c].length === fewest);
+    // Every candidate in turn, the least timed first.
+    const fewest = Math.min(...L.candidates.map(c => timed(L, c)));
+    const behind = L.candidates.filter(c => timed(L, c) === fewest);
     return { choice: behind[L.calls % behind.length], key };
   }
   if (L.trying === null && L.calls % RECHECK === 0) {
     // The best two of the rest, in turn.
-    const rest = choices.filter(c => c !== L.best)
+    const rest = L.candidates.filter(c => c !== L.best)
       .sort((a, b) => typical(L.times[a]) - typical(L.times[b]));
-    L.trying = rest[L.rechecks++ % Math.min(2, rest.length)];
-    L.times[L.trying] = [];
+    if (rest.length) {
+      L.trying = rest[L.rechecks++ % Math.min(2, rest.length)];
+      L.times[L.trying] = [];
+    }
   }
   // A runner-up is timed in turns with the best, so both see the same device.
   if (L.trying !== null) return { choice: L.calls % 2 ? L.trying : L.best, key };
@@ -199,14 +228,20 @@ function choiceFor(model, rows) {
 
 function record(key, choice, ms, rows) {
   const L = learned[key];
-  if (!L || !L.times[choice]) return;
-  const list = L.times[choice];
+  if (!L || !L.candidates.includes(choice)) return;
+  const list = L.times[choice] || (L.times[choice] = []);
   list.push(ms / rows);
   if (list.length > SAMPLES) list.shift();
   let changed = false;
   if (L.best === null) {
-    if (choices.some(c => L.times[c].length < SAMPLES)) return;
-    L.best = choices.reduce((a, b) => (typical(L.times[b]) < typical(L.times[a]) ? b : a));
+    if (L.candidates.some(c => timed(L, c) < SAMPLES)) return;
+    if (L.prec === null) {
+      // Precision decided; on to how many workers, at that precision.
+      L.prec = typical(L.times["old:8"]) < typical(L.times["old:f"]) ? "8" : "f";
+      L.candidates = spreadChoices(L.prec);
+      return;
+    }
+    L.best = L.candidates.reduce((a, b) => (typical(L.times[b]) < typical(L.times[a]) ? b : a));
     changed = true;
   } else if (L.trying !== null && choice === L.trying && list.length >= SAMPLES) {
     if (typical(list) < typical(L.times[L.best]) * MARGIN) { L.best = L.trying; changed = true; }
@@ -222,13 +257,13 @@ function tuningNow() {
   const out = {};
   for (const [key, L] of Object.entries(learned)) {
     if (!L.saved) continue;
-    const timed = choices.filter(c => L.times[c].length && isFinite(typical(L.times[c])));
+    const seen = L.candidates.filter(c => timed(L, c) && isFinite(typical(L.times[c])));
     out[key] = {
-      best: L.best,
-      ms: Object.fromEntries(timed.map(c => [c, +typical(L.times[c]).toFixed(3)])),
+      best: L.best, prec: L.prec,
+      ms: Object.fromEntries(seen.map(c => [c, +typical(L.times[c]).toFixed(3)])),
     };
   }
-  return { version: TUNING_VERSION, workers: slots.length - 1, precision, learned: out };
+  return { version: TUNING_VERSION, workers: slots.length - 1, learned: out };
 }
 
 const counters = { calls: 0, rows: 0, ms: 0, waitedMs: 0 };    // read by bench.html
@@ -242,10 +277,10 @@ let pending = null;
 
 function inferStart(model, flat, dims) {
   if (pending) throw new Error("a batch is already with the network");
-  if (precisionFor(model) === null) choosePrecision(model, flat, dims);
   const { choice, key } = choiceFor(model, dims[0]);
   // A worker's first calls on a network load it: not a time to learn from.
-  const cold = teamOf(choice, dims[0]).some(s => (s.warm[`${model}:${precisionFor(model)}`] || 0) < WARMUP);
+  const warm = `${model}:${parseChoice(choice).variant}`;
+  const cold = teamOf(choice, dims[0]).some(s => (s.warm[warm] || 0) < WARMUP);
   pending = { job: begin(choice, model, flat, dims), key, cold };
 }
 
@@ -269,35 +304,8 @@ function inferSync(model, flat, dims) {
   return inferFinish();
 }
 
-// ------------------------------------------------------------ precision
-// Hex, Connect Four and Ultimate have an 8-bit version of their network
-// (models.json: `file`, with the float one as `float_file`).  On a desktop the
-// 8-bit one is about 1.6x faster; on some phones it is slower.  So each device
-// times both, on the first batch the bots ask that network for -- a few runs
-// of each in turns, on the first worker alone -- and keeps the faster.
-const precision = {};      // model -> "int8" | "float", on this device
-
-function precisionFor(model) {
-  const meta = netMeta[model];
-  if (!meta || !meta.float_file) return "float";
-  return precision[model] || null;
-}
-
-function choosePrecision(model, flat, dims) {
-  const times = { float: [], int8: [] };
-  for (let round = 0; round < 4; round++) {
-    for (const variant of ["float", "int8"]) {
-      const job = begin("old", model, flat, dims, variant);
-      end(job);
-      if (round > 0) times[variant].push(job.ms);       // the first loads and settles
-    }
-  }
-  precision[model] = typical(times.int8) < typical(times.float) ? "int8" : "float";
-  self.postMessage({ type: "tuning", tuning: tuningNow() });
-}
-
 function teamOf(choice, rows) {
-  const k = choice === "old" ? 0 : parseInt(choice, 10);
+  const { k } = parseChoice(choice);
   return k === 0 ? [slots[0]] : slots.slice(1, 1 + Math.min(k, rows));
 }
 
