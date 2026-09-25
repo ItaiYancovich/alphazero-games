@@ -9,8 +9,6 @@
 (function () {
   "use strict";
 
-  const CTL_INTS = 64;
-  const DATA_FLOATS = 4 * 1024 * 1024;          // 16 MB of shared input/output
   const ls = {
     get(k) { try { return localStorage.getItem(k); } catch (e) { return null; } },
     set(k, v) { try { localStorage.setItem(k, v); } catch (e) { /* private mode */ } },
@@ -60,34 +58,28 @@
           + "cross-origin isolation). Try a recent Chrome, Edge, Firefox or Safari."));
         return;
       }
-      const sab = new SharedArrayBuffer(CTL_INTS * 4 + DATA_FLOATS * 4);
-      const channel = new MessageChannel();
-      const ortWorker = new Worker("ort-worker.js", { type: "module" });
-      engine = new Worker("engine-worker.js");
-      fetch("models/models.json").then(r => r.json()).then(models => {
-        ortWorker.postMessage({ type: "init", sab, models, port: channel.port1 },
-                              [channel.port1]);
-        let profiles = {};
-        try { profiles = JSON.parse(ls.get("azProfiles") || "{}"); } catch (e) { /* none */ }
-        engine.postMessage({ type: "init", sab, models, port: channel.port2, profiles },
-                           [channel.port2]);
-      }).catch(reject);
       const stages = { python: 0.15, numpy: 0.45, engine: 0.75 };
-      ortWorker.onmessage = ({ data }) => {
-        if (data.type === "error") console.warn("network worker:", data.message);
-      };
-      engine.onmessage = ({ data }) => {
-        if (data.type === "progress") setBoot(data.detail + "…", stages[data.stage]);
-        else if (data.type === "ready") { setBoot("Ready", 1); resolve(); }
-        else if (data.type === "fatal") reject(new Error(data.message));
-        else if (data.type === "error") console.warn("engine:", data.message);
-        else if (data.type === "profiles") ls.set("azProfiles", JSON.stringify(data.files));
-        else if (data.type === "reply") {
-          const p = pending.get(data.id);
-          if (p) { pending.delete(data.id); p.resolve(data); }
-        }
-      };
-      engine.onerror = ev => reject(new Error(ev.message || "the game engine failed to start"));
+      const read = key => { try { return JSON.parse(ls.get(key) || "null"); } catch (e) { return null; } };
+      fetch("models/models.json").then(r => r.json()).then(models => {
+        // The engine and its pool of network workers (pool.js).  How many of
+        // them to use is learned on the device; `azTuning` keeps it.
+        engine = EnginePool.spawn(models, {
+          extra: { profiles: read("azProfiles") || {}, tuning: read("azTuning") },
+        }).engine;
+        engine.onmessage = ({ data }) => {
+          if (data.type === "progress") setBoot(data.detail + "…", stages[data.stage]);
+          else if (data.type === "ready") { setBoot("Ready", 1); resolve(); }
+          else if (data.type === "fatal") reject(new Error(data.message));
+          else if (data.type === "error") console.warn("engine:", data.message);
+          else if (data.type === "profiles") ls.set("azProfiles", JSON.stringify(data.files));
+          else if (data.type === "tuning") ls.set("azTuning", JSON.stringify(data.tuning));
+          else if (data.type === "reply") {
+            const p = pending.get(data.id);
+            if (p) { pending.delete(data.id); p.resolve(data); }
+          }
+        };
+        engine.onerror = ev => reject(new Error(ev.message || "the game engine failed to start"));
+      }).catch(reject);
     });
     return engineReady;
   }

@@ -1,0 +1,254 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Speed Test — AlphaZero</title>
+<link rel="icon" href="icon.svg">
+<style>
+  :root {
+    --bg: #f0f4f9; --card: #ffffff; --ink: #1f1f1f; --muted: #5f6368; --line: #dde3ea;
+    --accent: #0b57d0; --accent-ink: #ffffff; --good: #146c2e; --bad: #b3261e;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #131314; --card: #1e1f20; --ink: #e3e3e3; --muted: #a8abb0; --line: #3c4043;
+      --accent: #a8c7fa; --accent-ink: #062e6f; --good: #6dd58c; --bad: #f2b8b5;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  main { max-width: 720px; margin: 0 auto; padding: 20px 16px 48px; }
+  h1 { font-size: 22px; margin: 4px 0 6px; }
+  p { margin: 6px 0; color: var(--muted); }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 14px;
+          padding: 14px 16px; margin: 14px 0; }
+  button { font: inherit; font-weight: 600; border: 0; border-radius: 999px; padding: 10px 20px;
+           background: var(--accent); color: var(--accent-ink); cursor: pointer; }
+  button:disabled { opacity: .45; cursor: default; }
+  button.quiet { background: transparent; color: var(--accent); border: 1px solid var(--line); }
+  .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+  #status { font-weight: 600; margin-top: 10px; min-height: 1.5em; }
+  .bar { height: 6px; background: var(--line); border-radius: 3px; overflow: hidden; margin-top: 8px; }
+  .bar > div { height: 100%; width: 0; background: var(--accent); transition: width .3s; }
+  table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+  th, td { text-align: right; padding: 6px 4px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  th:first-child, td:first-child { text-align: left; white-space: normal; }
+  th { font-size: 13px; color: var(--muted); font-weight: 600; }
+  .gain { color: var(--good); font-weight: 600; }
+  .loss { color: var(--bad); font-weight: 600; }
+  .scroll { overflow-x: auto; }
+  textarea { width: 100%; min-height: 160px; font: 12px/1.4 ui-monospace, Menlo, Consolas, monospace;
+             background: var(--bg); color: var(--ink); border: 1px solid var(--line);
+             border-radius: 10px; padding: 10px; }
+  code { font-size: 13px; }
+</style>
+<script src="coi-serviceworker.js"></script>
+<script src="pool.js"></script>
+</head>
+<body>
+<main>
+  <h1>Speed test</h1>
+  <p>Times the bots on this device in two setups: <b>before</b> (one network worker, as the
+     site used to run) and <b>after</b> (a pool of network workers, tuned to this device).
+     Each setup runs twice, alternating, so a phone warming up is fair to both.</p>
+  <p>Takes about 3–6 minutes. Keep this tab in front and the screen on; plugged in and
+     not in low-power mode is best.</p>
+
+  <div class="card">
+    <div class="row">
+      <button id="go">Start</button>
+      <button id="copy" class="quiet" disabled>Copy results</button>
+    </div>
+    <div id="status"></div>
+    <div class="bar"><div id="bar"></div></div>
+  </div>
+
+  <div class="card scroll" id="summary-card" hidden>
+    <p>Seconds per move at 400 simulations (lower is better); for the v3 bot, which
+       thinks for 2 seconds a move, simulations per second (higher is better).</p>
+    <table id="summary"></table>
+    <p id="tuned"></p>
+  </div>
+
+  <div class="card" id="raw-card" hidden>
+    <p>Everything measured, to paste back:</p>
+    <textarea id="raw" readonly></textarea>
+  </div>
+</main>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+
+// What each setup plays: [game, bot, simulations, moves, size, label].  The v3
+// bot opens from its book, so it gets extra moves to reach positions it
+// searches; only searched moves count.
+const CASES = [
+  ["hex", "az", 400, 3, "11", "Hex 11×11"],
+  ["c4", "az", 400, 4, "", "Connect Four"],
+  ["uttt", "az", 400, 4, "", "Ultimate TTT"],
+  ["uttt", "v3:2", 0, 13, "", "UTTT v3 bot"],
+];
+
+const PY = `
+import json, time, js
+import webgui as W
+S = W.SESSION
+S.set_pace(0.0)
+def stats():
+    s = js.inferStats
+    return s.calls, s.rows, s.ms
+def play(key, choice, sims, moves, size):
+    S.new_game(game=key, black=choice, white=choice, size=size,
+               black_sims=sims, white_sims=sims, seed=1)
+    spent, sims_done, secs = [], 0, 0.0
+    c0, r0, m0 = stats()
+    for _ in range(moves):
+        if not S.bot_pending():
+            break
+        t = time.perf_counter()
+        S.bot_think()
+        dt = time.perf_counter() - t
+        info = getattr(S._planned[2], "last_info", None) if S._planned else None
+        if choice.startswith("v3"):
+            if info and not info.get("book") and info.get("new_sims"):
+                spent.append(dt)
+                sims_done += info["new_sims"]
+                secs += info["seconds"]
+        else:
+            spent.append(dt)
+        S.bot_commit()
+    c1, r1, m1 = stats()
+    total = sum(spent)
+    return dict(moves=len(spent), ms=round(1000 * total / max(1, len(spent))),
+                sims_s=round(sims_done / secs) if secs else None,
+                batch=round((r1 - r0) / max(1, c1 - c0), 1),
+                net=round(100 * (m1 - m0) / (1000 * total)) if total else None)
+json.dumps([play(*c) for c in CASES])
+`;
+
+let nextId = 1;
+async function setup(models, workers, tuning) {
+  const t0 = performance.now();
+  const { engine, networks } = EnginePool.spawn(models, {
+    workers, extra: { profiles: {}, tuning },
+  });
+  const waiting = new Map();
+  await new Promise((resolve, reject) => {
+    engine.onmessage = ({ data }) => {
+      if (data.type === "ready") resolve();
+      else if (data.type === "fatal") reject(new Error(data.message));
+      else if (data.type === "bench") { waiting.get(data.id)(data); waiting.delete(data.id); }
+    };
+    engine.onerror = ev => reject(new Error(ev.message || "the engine failed to start"));
+  });
+  const boot = performance.now() - t0;
+  const run = code => new Promise(resolve => {
+    const id = nextId++;
+    waiting.set(id, resolve);
+    engine.postMessage({ type: "bench", id, code });
+  });
+  const stop = () => { engine.terminate(); networks.forEach(w => w.terminate()); };
+  return { boot, run, stop };
+}
+
+const results = { before: [], after: [] };
+const device = {
+  ua: navigator.userAgent, cores: navigator.hardwareConcurrency || null,
+  memory_gb: navigator.deviceMemory || null, isolated: self.crossOriginIsolated,
+  pool: EnginePool.defaultWorkers(),
+};
+let tuned = null;
+
+function progress(text, frac) {
+  $("status").textContent = text;
+  if (frac != null) $("bar").style.width = `${Math.round(frac * 100)}%`;
+}
+
+async function start() {
+  $("go").disabled = true;
+  if (!self.crossOriginIsolated) {
+    progress("This browser did not enable cross-origin isolation; reload the page once and try again.");
+    $("go").disabled = false;
+    return;
+  }
+  const models = await (await fetch("models/models.json")).json();
+  const plan = [["before", 1], ["after", null], ["before", 1], ["after", null]];
+  try {
+    for (let i = 0; i < plan.length; i++) {
+      const [name, workers] = plan[i];
+      progress(`Round ${i + 1} of ${plan.length} (${name}): starting the engine…`, i / plan.length);
+      // The first "after" round learns this device from nothing, as a new
+      // visitor's does; the second starts from what it learned, as a return
+      // visit does.
+      const s = await setup(models, workers || undefined, name === "after" ? tuned : null);
+      progress(`Round ${i + 1} of ${plan.length} (${name}): the bots are playing…`, (i + 0.2) / plan.length);
+      const reply = await s.run(`CASES = ${JSON.stringify(CASES.map(c => c.slice(0, 5)))}\n` + PY);
+      s.stop();
+      if (reply.result.startsWith("ERROR")) throw new Error(reply.result);
+      if (name === "after") tuned = reply.tuning;
+      results[name].push({ boot: Math.round(s.boot), cases: JSON.parse(reply.result) });
+      render();
+    }
+    progress("Done. Tap “Copy results” and paste them into the chat.", 1);
+  } catch (err) {
+    progress("Stopped: " + (err && err.message || err));
+    render();
+  }
+  $("copy").disabled = false;
+  $("go").disabled = false;
+  $("go").textContent = "Run again";
+}
+
+// Two rounds of each: moves are averaged, the v3 bot's speed too.
+function merged(name) {
+  return CASES.map((c, j) => {
+    const rows = results[name].map(r => r.cases[j]).filter(Boolean);
+    if (!rows.length) return null;
+    const avg = key => {
+      const v = rows.map(r => r[key]).filter(x => x != null);
+      return v.length ? v.reduce((a, b) => a + b, 0) / v.length : null;
+    };
+    return { ms: avg("ms"), sims_s: avg("sims_s") };
+  });
+}
+
+function render() {
+  const b = merged("before"), a = merged("after");
+  let html = "<tr><th>Bot</th><th>Before</th><th>After</th><th>Faster</th></tr>";
+  CASES.forEach((c, j) => {
+    const v3 = c[1].startsWith("v3");
+    const fmt = r => !r ? "…" : v3 ? (r.sims_s ? `${Math.round(r.sims_s)}/s` : "–")
+                                   : `${(r.ms / 1000).toFixed(2)} s`;
+    let gain = "";
+    if (b[j] && a[j]) {
+      const x = v3 ? a[j].sims_s / b[j].sims_s : b[j].ms / a[j].ms;
+      if (isFinite(x)) gain = `<span class="${x >= 1 ? "gain" : "loss"}">×${x.toFixed(2)}</span>`;
+    }
+    html += `<tr><td>${c[5]}</td><td>${fmt(b[j])}</td><td>${fmt(a[j])}</td><td>${gain}</td></tr>`;
+  });
+  $("summary").innerHTML = html;
+  $("summary-card").hidden = false;
+  if (tuned) {
+    const picks = Object.entries(tuned.learned || {})
+      .map(([key, v]) => `${key.replace("|", " ")}+ → ${v.best}`).join(", ");
+    $("tuned").textContent = `This device reports ${device.cores} cores; the pool has `
+      + `${tuned.workers} network workers. Learned spreads: ${picks || "none yet"}.`;
+  }
+  $("raw").value = JSON.stringify({ device, tuned, results }, null, 1);
+  $("raw-card").hidden = false;
+}
+
+$("go").onclick = start;
+$("copy").onclick = async () => {
+  const text = $("raw").value;
+  try { await navigator.clipboard.writeText(text); progress("Copied — paste it into the chat."); }
+  catch (e) { $("raw").select(); document.execCommand("copy"); progress("Copied (select-all) — paste it into the chat."); }
+};
+</script>
+</body>
+</html>
