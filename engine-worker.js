@@ -7,8 +7,9 @@
 // request never waits behind more than one step.
 importScripts("pyodide/pyodide.js");
 
-const CTL_INTS = 64;
-let slots = [];            // one per network worker: {ctl, data, port}
+const CTL_INTS = 64, ROWS = CTL_INTS - 1;
+let jobBlock = null, input = null, output = null;
+let slots = [];            // one per network worker: {ctl, port, warm}
 let py = null, web = null;
 const queue = [];
 let busy = false;
@@ -18,131 +19,131 @@ let pumpTimer = null;
 // ---------------------------------------------------------- the network call
 // Synchronous on purpose: see ort-worker.js.
 //
-// A search asks for a batch of positions at a time.  With a pool of network
-// workers the batch is cut into slices, one per worker, all run at once, and
-// put back together in order -- the caller cannot tell.  How many workers a
-// batch is spread over is learned on this device: see the tuning below.
+// A search asks for a batch of positions at a time.  The batch goes into the
+// shared buffer once, and a job goes either to the first network worker alone
+// or to some of the pool beside it, who share it out among themselves as they
+// go (see ort-worker.js) and write the answers back in order -- the caller
+// cannot tell.  Which is learned on this device: see the tuning below.
 
-// Send `rows` positions, starting at row `from`, to one worker's slot.
-function post(slot, model, flat, dims, from, rows) {
-  const row = flat.length / dims[0];
-  if (rows * row > slot.data.length) throw new Error("input too large for the shared buffer");
-  slot.data.set(flat.subarray(from * row, (from + rows) * row), 0);
-  Atomics.store(slot.ctl, 0, 1);
-  const d = Array.from(dims);
-  d[0] = rows;
-  slot.port.postMessage({ model, dims: d, n: rows * row });
-}
-
-// Wait for one worker's answer and read its outputs out of the slot.  The
-// extra workers get a deadline: one that died (a phone out of memory, say)
-// would otherwise be waited for forever.
+// Wait for one worker to finish its part.  The extra workers get a deadline:
+// one that died (a phone out of memory, say) would otherwise be waited for
+// forever.
 const DEADLINE = 30000;
-function collect(slot, patient) {
-  const { ctl, data } = slot;
+function finished(slot, patient) {
+  const { ctl } = slot;
   const t0 = performance.now();
   while (Atomics.load(ctl, 0) === 1) {
     Atomics.wait(ctl, 0, 1, 2000);
-    if (!patient && performance.now() - t0 > DEADLINE) return null;
+    if (!patient && performance.now() - t0 > DEADLINE) return 3;
   }
-  const failed = Atomics.load(ctl, 0) === 3;
-  const outs = [];
-  let at = 0;
-  for (let i = 0; !failed && i < ctl[1]; i++) {
-    const rank = ctl[2 + i * 5];
-    const shape = [];
-    let size = 1;
-    for (let k = 0; k < rank; k++) { shape.push(ctl[3 + i * 5 + k]); size *= ctl[3 + i * 5 + k]; }
-    outs.push({ data: data.slice(at, at + size), dims: shape });
-    at += size;
-  }
+  const state = Atomics.load(ctl, 0);
   Atomics.store(ctl, 0, 0);
-  return failed ? null : outs;
+  return state;
 }
 
-const whole = new Set();   // models whose outputs cannot be cut by row
+const whole = new Set();   // models whose outputs cannot be cut by position
+let jobs = 0;
 
-function inferOn(workers, model, flat, dims) {
+// `choice` is "old" -- the first worker alone, on its own threads, as the site
+// always ran -- or "4x2": four of the pool, the batch cut into two pieces a
+// worker (more pieces let a worker on a fast core take more of them).
+function inferOn(choice, model, flat, dims) {
   const n = dims[0];
-  let k = whole.has(model) ? 1 : Math.max(1, Math.min(workers, slots.length, n));
-  // A slice too big for the smaller slots goes whole to the first, the big one.
-  if (k > 1 && Math.ceil(n / k) * (flat.length / n) > slots[k - 1].data.length) k = 1;
-  const parts = [];
-  for (let i = 0, from = 0; i < k; i++) {
-    const rows = Math.floor(n / k) + (i < n % k ? 1 : 0);
-    post(slots[i], model, flat, dims, from, rows);
-    parts.push(rows);
-    from += rows;
+  if (whole.has(model)) choice = "old";
+  const [k, per] = choice === "old" ? [0, 1] : choice.split("x").map(Number);
+  const team = k === 0 ? [slots[0]] : slots.slice(1, 1 + Math.min(k, n));
+  if (flat.length > input.length) throw new Error("input too large for the shared buffer");
+  input.set(flat, 0);
+  const chunk = k === 0 ? n : Math.max(1, Math.ceil(n / (team.length * per)));
+  const id = ++jobs;
+  Atomics.store(jobBlock, 1, 0);
+  Atomics.store(jobBlock, 0, id);
+  for (const slot of team) {
+    Atomics.store(slot.ctl, 0, 1);
+    slot.ctl[ROWS] = 0;
+    slot.port.postMessage({ id, model, dims: Array.from(dims), n, chunk });
   }
-  // Collect every slot, even after a failure, so each is idle again.
-  const answers = parts.map((_, i) => collect(slots[i], i === 0));
-  const lost = answers.findIndex(a => a === null);
-  if (lost === 0) throw new Error("the network failed");
-  if (lost > 0) {
-    // An extra worker failed: carry on without it and every one after it.
-    console.warn(`network worker ${lost} failed; using ${lost} from now on`);
-    slots.length = lost;
+  // Hear from every worker, even after a failure, so each is idle again.
+  const states = team.map(slot => finished(slot, slot === slots[0]));
+  Atomics.store(jobBlock, 0, 0);            // anyone still at it: stop
+  const lost = states.indexOf(3);
+  if (lost >= 0 && team[lost] === slots[0]) throw new Error("the network failed");
+  if (lost >= 0) {
+    // A worker of the pool failed: carry on without it and every one after it.
+    const at = slots.indexOf(team[lost]);
+    console.warn(`network worker ${at} failed; the pool is ${at - 1} from now on`);
+    slots.length = at;
     setTuning(null);
     for (const key of Object.keys(learned)) delete learned[key];
-    return inferOn(workers, model, flat, dims);
+    return inferOn("old", model, flat, dims);
   }
-  if (k === 1) return answers[0];
-  // Every output must lead with the batch, or its slices cannot be joined:
-  // run such a model whole from now on.
-  if (answers.some((outs, i) => outs.some(o => o.dims[0] !== parts[i]))) {
+  if (states.includes(4)) {
+    // Its outputs do not lead with the batch: run it in one piece from now on.
     whole.add(model);
-    return inferOn(1, model, flat, dims);
+    return inferOn("old", model, flat, dims);
   }
-  return answers[0].map((first, j) => {
-    const all = new Float32Array(answers.reduce((t, outs) => t + outs[j].data.length, 0));
-    let at = 0;
-    for (const outs of answers) { all.set(outs[j].data, at); at += outs[j].data.length; }
-    const shape = first.dims.slice();
-    shape[0] = n;
-    return { data: all, dims: shape };
-  });
+  // The shapes, from any worker that answered; the batch is all of them.
+  const from = team.find(s => s.ctl[ROWS] > 0);
+  const answered = team.reduce((t, s) => t + s.ctl[ROWS], 0);
+  if (!from || answered !== n) throw new Error("the network answered part of the batch");
+  const { ctl } = from;
+  const outs = [];
+  let at = 0;
+  for (let i = 0; i < ctl[1]; i++) {
+    const shape = [];
+    for (let j = 0; j < ctl[2 + i * 5]; j++) shape.push(ctl[3 + i * 5 + j]);
+    if (k > 0) shape[0] = n;
+    const size = shape.reduce((a, b) => a * b, 1);
+    outs.push({ data: output.slice(at, at + size), dims: shape });
+    at += size;
+  }
+  return outs;
 }
 
 // ------------------------------------------------------------ the tuning
-// How many workers a batch is best spread over depends on the device -- how
-// many cores it has and, on a phone, how many of them are fast ones: a batch
-// cut into eight waits for its slowest slice, and that slice may be on a slow
-// core -- and on the network and the size of the batch.  So it is learned
-// from the bots' own calls.  Each network and batch size starts on every
-// worker and steps down, one spread at a time, for as long as fewer workers
-// are no slower -- past the cores there are, eight and six can tie, and four
-// is still ahead -- timing the two spreads being compared in turns, so a
-// device warming up or slowing down is fair to both.  After that, now and
-// then a spread either side of the best is timed again, since a phone slows
-// down as it heats up.  The page keeps what was learned for the next visit.
-const TUNING_VERSION = 2;
-const SAMPLES = 5;         // calls to time a spread on before judging it
-const MARGIN = 0.97;       // how much faster a spread must be to take over the best
-const RECHECK = 25;        // calls between tries of a neighbour of the best
+// Which way is fastest depends on the device -- how many cores it has, how
+// many of them are fast ones, how hot it is -- and on the network and the
+// size of the batch.  So it is learned from the bots' own calls: for each
+// network and batch size, every choice is timed on a few real batches, taking
+// turns so a device warming up or slowing down is fair to all, and the
+// fastest is used from then on.  "old" is one of the choices, so the result
+// is never slower than the site was.  Now and then the runners-up are timed
+// again, since a phone slows down as it heats up.  The page keeps what was
+// learned for the next visit.
+const TUNING_VERSION = 3;
+const SAMPLES = 5;         // calls to time a choice on before judging it
+const MARGIN = 0.97;       // how much faster a choice must be to take over the best
+const RECHECK = 25;        // calls between second looks at a runner-up
 const WARMUP = 2;          // a worker's first calls on a network load and settle it
-let choices = [1];         // the spreads worth trying on this pool
+let choices = ["old"];
 const learned = {};        // "model|8" -> see `entry`
 
-function entry(best) {
+function entry() {
   return {
-    best,                    // the spread in use
-    trying: null,            // the spread being compared with it, if any
-    settled: false,          // done stepping down
+    best: null,              // the choice in use, once every one has been timed
+    trying: null,            // a runner-up being timed again, if any
     saved: false,            // told the page
     calls: 0,
-    times: Object.fromEntries(choices.map(k => [k, []])),   // recent ms per position
+    rechecks: 0,
+    times: Object.fromEntries(choices.map(c => [c, []])),   // recent ms per position
   };
 }
 
 function setTuning(saved) {
-  const n = slots.length;
-  choices = [...new Set([1, 2, 3, 4, 6, 8, n])].filter(k => k <= n).sort((a, b) => a - b);
-  if (!saved || saved.version !== TUNING_VERSION || saved.workers !== n) return;
+  const pool = slots.length - 1;
+  const sizes = [...new Set([2, 3, 4, 6, 8, pool])].filter(k => k <= pool).sort((a, b) => a - b);
+  // Two pieces a worker only where there are enough workers for some to be
+  // on slow cores.
+  choices = ["old", ...sizes.map(k => `${k}x1`), ...sizes.filter(k => k >= 4).map(k => `${k}x2`)];
+  if (!saved || saved.version !== TUNING_VERSION || saved.workers !== pool) return;
   for (const [key, { best, ms }] of Object.entries(saved.learned || {})) {
     if (!choices.includes(best)) continue;
-    const L = learned[key] = entry(best);
-    L.settled = L.saved = true;
-    for (const k of choices) if (ms[k] != null) L.times[k] = Array(SAMPLES).fill(ms[k]);
+    const L = learned[key] = entry();
+    L.best = best;
+    L.saved = true;
+    for (const c of choices) {
+      L.times[c] = Array(SAMPLES).fill(ms[c] != null ? ms[c] : c === best ? 0 : Infinity);
+    }
   }
 }
 
@@ -159,52 +160,45 @@ function typical(list) {
   return s.length ? s[Math.floor(s.length / 2)] : Infinity;
 }
 
-const below = k => choices[choices.indexOf(k) - 1];
-const above = k => choices[choices.indexOf(k) + 1];
-
-function spreadFor(model, rows) {
-  if (choices.length < 2 || rows < 2 || whole.has(model)) return { k: 1 };
+function choiceFor(model, rows) {
+  if (choices.length < 2 || rows < 2 || whole.has(model)) return { choice: "old" };
   const key = `${model}|${sizeOf(rows)}`;
-  const L = learned[key] || (learned[key] = entry(choices[choices.length - 1]));
+  const L = learned[key] || (learned[key] = entry());
   L.calls++;
-  if (!L.settled) {
-    if (L.times[L.best].length >= SAMPLES && L.trying === null) {
-      L.trying = below(L.best) ?? null;
-      if (L.trying === null) L.settled = true;
-      else L.times[L.trying] = [];
-    }
-    if (L.trying !== null) return { k: L.calls % 2 ? L.trying : L.best, key };
-    return { k: L.best, key };
+  if (L.best === null) {
+    // Every choice in turn, the least timed first.
+    const fewest = Math.min(...choices.map(c => L.times[c].length));
+    const behind = choices.filter(c => L.times[c].length === fewest);
+    return { choice: behind[L.calls % behind.length], key };
   }
   if (L.trying === null && L.calls % RECHECK === 0) {
-    const side = (L.calls / RECHECK) % 2 ? below(L.best) : above(L.best);
-    const k = side ?? below(L.best) ?? above(L.best);
-    if (k !== undefined) { L.trying = k; L.times[k] = []; }
+    // The best two of the rest, in turn.
+    const rest = choices.filter(c => c !== L.best)
+      .sort((a, b) => typical(L.times[a]) - typical(L.times[b]));
+    L.trying = rest[L.rechecks++ % Math.min(2, rest.length)];
+    L.times[L.trying] = [];
   }
-  if (L.trying !== null) return { k: L.calls % 2 ? L.trying : L.best, key };
-  return { k: L.best, key };
+  // A runner-up is timed in turns with the best, so both see the same device.
+  if (L.trying !== null) return { choice: L.calls % 2 ? L.trying : L.best, key };
+  return { choice: L.best, key };
 }
 
-function record(key, k, ms, rows) {
+function record(key, choice, ms, rows) {
   const L = learned[key];
-  if (!L) return;
-  const list = L.times[k];
+  if (!L || !L.times[choice]) return;
+  const list = L.times[choice];
   list.push(ms / rows);
   if (list.length > SAMPLES) list.shift();
   let changed = false;
-  if (L.trying !== null && k === L.trying && list.length >= SAMPLES) {
-    const mine = typical(list), best = typical(L.times[L.best]);
-    // Stepping down, fewer workers win a tie; after that, a spread has to
-    // be clearly faster to take over.
-    const better = L.settled ? mine < best * MARGIN : mine <= best;
-    if (better) { L.best = L.trying; changed = true; }
+  if (L.best === null) {
+    if (choices.some(c => L.times[c].length < SAMPLES)) return;
+    L.best = choices.reduce((a, b) => (typical(L.times[b]) < typical(L.times[a]) ? b : a));
+    changed = true;
+  } else if (L.trying !== null && choice === L.trying && list.length >= SAMPLES) {
+    if (typical(list) < typical(L.times[L.best]) * MARGIN) { L.best = L.trying; changed = true; }
     L.trying = null;
-    if (!L.settled && !better) L.settled = true;
-  } else if (!L.settled && L.trying === null && below(L.best) === undefined
-             && list.length >= SAMPLES) {
-    L.settled = true;
   }
-  if (L.settled && (changed || !L.saved)) {
+  if (changed || !L.saved) {
     L.saved = true;
     self.postMessage({ type: "tuning", tuning: tuningNow() });
   }
@@ -214,28 +208,29 @@ function tuningNow() {
   const out = {};
   for (const [key, L] of Object.entries(learned)) {
     if (!L.saved) continue;
-    const timed = choices.filter(k => L.times[k].length);
+    const timed = choices.filter(c => L.times[c].length && isFinite(typical(L.times[c])));
     out[key] = {
       best: L.best,
-      ms: Object.fromEntries(timed.map(k => [k, +typical(L.times[k]).toFixed(3)])),
+      ms: Object.fromEntries(timed.map(c => [c, +typical(L.times[c]).toFixed(3)])),
     };
   }
-  return { version: TUNING_VERSION, workers: slots.length, learned: out };
+  return { version: TUNING_VERSION, workers: slots.length - 1, learned: out };
 }
 
 const counters = { calls: 0, rows: 0, ms: 0 };    // read by bench.html
 self.inferStats = counters;
 
 function inferSync(model, flat, dims) {
-  const { k, key } = spreadFor(model, dims[0]);
-  // A worker's first call on a network loads it: not a time to learn from.
-  const used = slots.slice(0, Math.min(k, dims[0]));
+  const { choice, key } = choiceFor(model, dims[0]);
+  // A worker's first calls on a network load it: not a time to learn from.
+  const k = choice === "old" ? 0 : parseInt(choice, 10);
+  const used = k === 0 ? [slots[0]] : slots.slice(1, 1 + Math.min(k, dims[0]));
   const cold = used.some(s => (s.warm[model] || 0) < WARMUP);
   const t0 = performance.now();
-  const outs = inferOn(k, model, flat, dims);
+  const outs = inferOn(choice, model, flat, dims);
   const ms = performance.now() - t0;
   used.forEach(s => { s.warm[model] = (s.warm[model] || 0) + 1; });
-  if (key && !cold) record(key, k, ms, dims[0]);
+  if (key && !cold) record(key, choice, ms, dims[0]);
   counters.calls++;
   counters.rows += dims[0];
   counters.ms += ms;
@@ -294,10 +289,13 @@ async function loadUttt() {
 }
 
 async function boot(msg) {
-  slots = (msg.slots || [{ offset: 0, bytes: msg.sab.byteLength }]).map((s, i) => ({
-    ctl: new Int32Array(msg.sab, s.offset, CTL_INTS),
-    data: new Float32Array(msg.sab, s.offset + CTL_INTS * 4, s.bytes / 4 - CTL_INTS),
-    port: msg.ports ? msg.ports[i] : msg.port,
+  const { sab, layout } = msg;
+  jobBlock = new Int32Array(sab, layout.job, 16);
+  input = new Float32Array(sab, layout.input, layout.inputFloats);
+  output = new Float32Array(sab, layout.output, layout.outputFloats);
+  slots = msg.ports.map((port, i) => ({
+    ctl: new Int32Array(sab, layout.ctl[i], CTL_INTS),
+    port,
     warm: {},                // network -> calls this worker has answered
   }));
   setTuning(msg.tuning);
