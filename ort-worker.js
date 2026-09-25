@@ -7,7 +7,11 @@
 // buffer, posts a request here and blocks on `Atomics.wait`; this worker runs
 // the model, writes the outputs into the same buffer and wakes it.
 //
-// Shared layout (see engine-worker.js): an Int32 control block --
+// There is a pool of these, one per core the device offers (see bridge.js),
+// each with its own slot of the shared buffer: the engine splits a batch of
+// positions across as many of them as this device runs fastest with.
+//
+// Shared layout of a slot (see engine-worker.js): an Int32 control block --
 //   [0] state: 0 idle, 1 request, 2 done, 3 failed
 //   [1] number of outputs
 //   [2 + 5i] rank of output i, then up to four dims
@@ -19,8 +23,10 @@ let ctl = null, data = null, models = null;
 const sessions = {};
 
 ort.env.wasm.wasmPaths = new URL("./ort/", import.meta.url).href;
-// Threads only exist where the page is cross-origin isolated; four is plenty
-// for networks this size, and leaves the machine responsive.
+// Threads only exist where the page is cross-origin isolated.  A lone worker
+// splits each network call over a few; in a pool, each worker runs on one
+// thread and the pool splits the batch instead -- on a batch of a dozen
+// positions that wastes far less time waiting between threads.
 ort.env.wasm.numThreads = self.crossOriginIsolated
   ? Math.max(1, Math.min(4, (navigator.hardwareConcurrency || 2) - 1)) : 1;
 
@@ -60,14 +66,19 @@ async function run({ model, dims, n }) {
 
 self.onmessage = async ({ data: msg }) => {
   if (msg.type === "init") {
-    ctl = new Int32Array(msg.sab, 0, CTL_INTS);
-    data = new Float32Array(msg.sab, CTL_INTS * 4);
+    const at = msg.offset || 0, bytes = msg.bytes || msg.sab.byteLength - at;
+    ctl = new Int32Array(msg.sab, at, CTL_INTS);
+    data = new Float32Array(msg.sab, at + CTL_INTS * 4, bytes / 4 - CTL_INTS);
     models = msg.models;
+    if (msg.threads) ort.env.wasm.numThreads = msg.threads;
     // Requests arrive on a port straight from the engine worker, which is
     // blocked while it waits and cannot go through the page.
     msg.port.onmessage = ({ data: req }) => run(req);
-    // Load every model up front, off the critical path of the first move.
-    Promise.all(Object.keys(models).map(session))
+    // The first worker loads every model up front, off the critical path of
+    // the first move.  The rest of the pool loads a model when it is first
+    // asked for it: most visits play one or two games, and every model in
+    // every worker would cost a phone well over a hundred megabytes a worker.
+    Promise.all(msg.lazy ? [] : Object.keys(models).map(session))
       .then(() => self.postMessage({ type: "models-ready" }))
       .catch(err => self.postMessage({ type: "error", message: String(err) }));
     self.postMessage({ type: "ready" });
