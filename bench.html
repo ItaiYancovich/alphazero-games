@@ -54,7 +54,8 @@
   <h1>Speed test</h1>
   <p>Times the bots on this device in two setups: <b>before</b> (one network worker, as the
      site used to run) and <b>after</b> (a pool of network workers, tuned to this device).
-     Each setup runs twice, alternating, so a phone warming up is fair to both.</p>
+     They run after–before–before–after, so a phone that slows down as it warms up is
+     fair to both.</p>
   <p>Takes about 3–6 minutes. Keep this tab in front and the screen on; plugged in and
      not in low-power mode is best.</p>
 
@@ -177,13 +178,13 @@ async function start() {
     return;
   }
   const models = await (await fetch("models/models.json")).json();
-  const plan = [["before", 1], ["after", null], ["before", 1], ["after", null]];
+  const plan = [["after", null], ["before", 1], ["before", 1], ["after", null]];
   try {
     for (let i = 0; i < plan.length; i++) {
       const [name, workers] = plan[i];
       progress(`Round ${i + 1} of ${plan.length} (${name}): starting the engine…`, i / plan.length);
       // The first "after" round learns this device from nothing, as a new
-      // visitor's does; the second starts from what it learned, as a return
+      // visitor's does; the last starts from what it learned, as a return
       // visit does.
       const s = await setup(models, workers || undefined, name === "after" ? tuned : null);
       progress(`Round ${i + 1} of ${plan.length} (${name}): the bots are playing…`, (i + 0.2) / plan.length);
