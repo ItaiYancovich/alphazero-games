@@ -52,10 +52,11 @@
 <body>
 <main>
   <h1>Speed test</h1>
-  <p>Times the bots on this device in two setups: <b>before</b> (one network worker, as the
-     site used to run) and <b>after</b> (a pool of network workers, tuned to this device).
-     They run after–before–before–after, so a phone that slows down as it warms up is
-     fair to both.</p>
+  <p>Times the bots on this device, each playing the rule-based bot as it would play you,
+     in two setups: <b>before</b> (the site as it was: one network worker) and <b>after</b>
+     (a pool of network workers tuned to this device, an evaluation cache, and the search
+     running beside the network). They run after–before–before–after, so a phone that slows
+     down as it warms up is fair to both.</p>
   <p>Takes about 3–6 minutes. Keep this tab in front and the screen on; plugged in and
      not in low-power mode is best.</p>
 
@@ -85,50 +86,58 @@
 "use strict";
 const $ = id => document.getElementById(id);
 
-// What each setup plays: [game, bot, simulations, moves, size, label].  The v3
-// bot opens from its book, so it gets extra moves to reach positions it
-// searches; only searched moves count.
+// What each setup plays: [game, bot, simulations, plies, size, label].  The
+// bot plays the rule-based bot, as it would play a person: only its own moves
+// are timed.  The v3 bot opens from its book, so it gets extra plies to reach
+// positions it searches; only searched moves count.
 const CASES = [
-  ["hex", "az", 400, 3, "11", "Hex 11×11"],
-  ["c4", "az", 400, 4, "", "Connect Four"],
-  ["uttt", "az", 400, 4, "", "Ultimate TTT"],
-  ["uttt", "v3:2", 0, 13, "", "UTTT v3 bot"],
+  ["hex", "az", 400, 8, "11", "Hex 11×11"],
+  ["c4", "az", 400, 10, "", "Connect Four"],
+  ["uttt", "az", 400, 10, "", "Ultimate TTT"],
+  ["rps2", "az", 400, 8, "", "Intransitive"],
+  ["uttt", "v3:2", 0, 28, "", "UTTT v3 bot"],
 ];
 
+// FAST says which setup: the evaluation cache and the search running beside
+// the network, or neither (the site as it was, with "before"'s one worker).
 const PY = `
 import json, time, js
 import webgui as W
 S = W.SESSION
 S.set_pace(0.0)
+W.CACHE.enabled = W.BACKGROUND = FAST
 def stats():
     s = js.inferStats
-    return s.calls, s.rows, s.ms
-def play(key, choice, sims, moves, size):
-    S.new_game(game=key, black=choice, white=choice, size=size,
+    return s.calls, s.rows, s.waitedMs, W.CACHE.hits
+def play(key, choice, sims, plies, size):
+    S.new_game(game=key, black=choice, white="rule", size=size,
                black_sims=sims, white_sims=sims, seed=1)
+    bot = S.board.to_move
     spent, sims_done, secs = [], 0, 0.0
-    c0, r0, m0 = stats()
-    for _ in range(moves):
+    c0, r0, w0, h0 = stats()
+    for _ in range(plies):
         if not S.bot_pending():
             break
+        mine = S.board.to_move == bot
         t = time.perf_counter()
         S.bot_think()
         dt = time.perf_counter() - t
         info = getattr(S._planned[2], "last_info", None) if S._planned else None
-        if choice.startswith("v3"):
+        if mine and choice.startswith("v3"):
             if info and not info.get("book") and info.get("new_sims"):
                 spent.append(dt)
                 sims_done += info["new_sims"]
                 secs += info["seconds"]
-        else:
+        elif mine:
             spent.append(dt)
         S.bot_commit()
-    c1, r1, m1 = stats()
+    c1, r1, w1, h1 = stats()
     total = sum(spent)
     return dict(moves=len(spent), ms=round(1000 * total / max(1, len(spent))),
                 sims_s=round(sims_done / secs) if secs else None,
                 batch=round((r1 - r0) / max(1, c1 - c0), 1),
-                net=round(100 * (m1 - m0) / (1000 * total)) if total else None)
+                cached=round(100 * (h1 - h0) / max(1, r1 - r0 + h1 - h0)),
+                waiting=round(100 * (w1 - w0) / (1000 * total)) if total else None)
 json.dumps([play(*c) for c in CASES])
 `;
 
@@ -178,6 +187,9 @@ async function start() {
     return;
   }
   const models = await (await fetch("models/models.json")).json();
+  // "before" runs the networks as they were: full precision.
+  const floats = JSON.parse(JSON.stringify(models));
+  for (const m of Object.values(floats)) if (m.float_file) m.file = m.float_file;
   const plan = [["after", null], ["before", 1], ["before", 1], ["after", null]];
   try {
     for (let i = 0; i < plan.length; i++) {
@@ -186,9 +198,11 @@ async function start() {
       // The first "after" round learns this device from nothing, as a new
       // visitor's does; the last starts from what it learned, as a return
       // visit does.
-      const s = await setup(models, workers || undefined, name === "after" ? tuned : null);
+      const s = await setup(name === "after" ? models : floats, workers || undefined,
+                            name === "after" ? tuned : null);
       progress(`Round ${i + 1} of ${plan.length} (${name}): the bots are playing…`, (i + 0.2) / plan.length);
-      const reply = await s.run(`CASES = ${JSON.stringify(CASES.map(c => c.slice(0, 5)))}\n` + PY);
+      const reply = await s.run(`CASES = ${JSON.stringify(CASES.map(c => c.slice(0, 5)))}\n`
+                                + `FAST = ${name === "after" ? "True" : "False"}\n` + PY);
       s.stop();
       if (reply.result.startsWith("ERROR")) throw new Error(reply.result);
       if (name === "after") tuned = reply.tuning;

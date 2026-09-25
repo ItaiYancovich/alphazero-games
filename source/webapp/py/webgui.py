@@ -35,25 +35,125 @@ import numpy as np
 
 # --------------------------------------------------------------- the network
 _infer = None           # set by the worker: (model, planes) -> list of arrays
+_infer_start = None     # (model, planes) -> wait() -> list of arrays, where the
+                        # network can answer while Python goes on (see WebNet.start)
+BACKGROUND = True       # use that when it is there (bench.html turns it off to compare)
 _MODELS: dict = {}      # models.json, keyed by model name
 _BY_PATH: dict = {}     # checkpoint path (as the adapters spell it) -> model name
 
 
-def set_infer(js_fn) -> None:
-    """Install the worker's synchronous ``(model, data, dims) -> [{data, dims}]``."""
-    global _infer
+def set_infer(js_fn, js_start=None, js_finish=None) -> None:
+    """Install the worker's synchronous ``(model, data, dims) -> [{data, dims}]``
+    and, when given, its two halves: ``js_start`` posts the batch to the network
+    and returns at once, ``js_finish`` waits for that batch's answer."""
+    global _infer, _infer_start
     from pyodide.ffi import to_js
 
-    def run(name: str, planes: np.ndarray) -> list[np.ndarray]:
-        flat = np.ascontiguousarray(planes, dtype=np.float32).reshape(-1)
-        result = js_fn(name, to_js(flat), to_js([int(d) for d in planes.shape]))
+    def unpack(result) -> list[np.ndarray]:
         outs = []
         for item in result:
             data = np.frombuffer(item.data.to_py(), dtype=np.float32).copy()
             outs.append(data.reshape([int(d) for d in item.dims.to_py()]))
         return outs
 
+    def call(name: str, planes: np.ndarray) -> list[np.ndarray]:
+        return unpack(js_fn(name, to_js(planes.reshape(-1)), to_js([int(d) for d in planes.shape])))
+
+    def begin(name: str, planes: np.ndarray):
+        js_start(name, to_js(planes.reshape(-1)), to_js([int(d) for d in planes.shape]))
+        return lambda: unpack(js_finish())
+
+    def run(name: str, planes: np.ndarray) -> list[np.ndarray]:
+        planes = np.ascontiguousarray(planes, dtype=np.float32)
+        return CACHE.run(name, planes, lambda some: call(name, some))
+
+    def run_start(name: str, planes: np.ndarray):
+        planes = np.ascontiguousarray(planes, dtype=np.float32)
+        return CACHE.start(name, planes, lambda some: begin(name, some),
+                           lambda some: call(name, some))
+
     _infer = run
+    _infer_start = run_start if js_start is not None else None
+
+
+class EvalCache:
+    """The network's answers, by position, for positions the search meets again.
+
+    A search reaches the same position by different move orders, and a bot's
+    next search walks much of the tree its last one did: in Connect Four
+    against a person, over half the positions a bot asks about are ones it has
+    asked about before.  A network's answer for a position depends on that
+    position alone, so answers are kept, keyed by a digest of the input planes
+    -- which works for every network without knowing its game -- and those
+    positions skip the network.  The oldest answers go first once the cache is
+    full.
+    """
+
+    def __init__(self, floats: int = 4_000_000):
+        from collections import OrderedDict
+
+        self.limit = floats          # numbers kept, 4 bytes each: 16 MB
+        self.held = 0
+        self.entries: OrderedDict = OrderedDict()
+        self.whole: set[str] = set()  # networks whose outputs are not one row a position
+        self.enabled = True
+        self.rows = self.hits = 0
+
+    def run(self, name: str, planes: np.ndarray, infer) -> list[np.ndarray]:
+        """``infer(planes)``, from the cache where it can be."""
+        def now(some):
+            out = infer(some)
+            return lambda: out
+        return self.start(name, planes, now, infer)()
+
+    def start(self, name: str, planes: np.ndarray, begin, infer):
+        """The same, for a network that answers in the background: ``begin``
+        hands it the positions not held and returns a wait; so does this."""
+        if not self.enabled or name in self.whole or len(planes) == 0:
+            return begin(planes)
+        import hashlib
+
+        n = len(planes)
+        rows = planes.reshape(n, -1)
+        keys = [(name, hashlib.blake2b(rows[i], digest_size=16).digest()) for i in range(n)]
+        found = [self.entries.get(k) for k in keys]
+        self.rows += n
+        # Each position not held goes to the network once, even if the batch
+        # has it twice (two move orders reaching it in the same batch).
+        wanted: dict = {}
+        for i, got in enumerate(found):
+            if got is None:
+                wanted.setdefault(keys[i], i)
+            else:
+                self.hits += 1
+                self.entries.move_to_end(keys[i])
+        wait = begin(planes[list(wanted.values())] if len(wanted) < n else planes) if wanted else None
+
+        def finish() -> list[np.ndarray]:
+            if wait is not None:
+                outs = wait()
+                if any(o.ndim == 0 or o.shape[0] != len(wanted) for o in outs):
+                    self.whole.add(name)
+                    return outs if len(wanted) == n else infer(planes)
+                for j, key in enumerate(wanted):
+                    answer = tuple(o[j].copy() for o in outs)
+                    self._keep(key, answer)
+                    for i in range(n):
+                        if found[i] is None and keys[i] == key:
+                            found[i] = answer
+            return [np.stack([row[j] for row in found]) for j in range(len(found[0]))]
+
+        return finish
+
+    def _keep(self, key, answer) -> None:
+        self.entries[key] = answer
+        self.held += sum(a.size for a in answer)
+        while self.held > self.limit and self.entries:
+            _, old = self.entries.popitem(last=False)
+            self.held -= sum(a.size for a in old)
+
+
+CACHE = EvalCache()
 
 
 class WebNet:
@@ -73,17 +173,35 @@ class WebNet:
         self.training = False
 
     def _run(self, x):
+        return self._named(_infer(self.name, self._planes(x)))
+
+    @staticmethod
+    def _planes(x) -> np.ndarray:
+        return np.ascontiguousarray(np.asarray(x.a if hasattr(x, "a") else x), dtype=np.float32)
+
+    def _named(self, outs) -> dict:
         import torch
 
-        planes = np.ascontiguousarray(np.asarray(x.a if hasattr(x, "a") else x),
-                                      dtype=np.float32)
-        outs = _infer(self.name, planes)
         return {n: torch.Tensor(o) for n, o in zip(self.outputs, outs)}
 
-    def __call__(self, x):
-        out = self._run(x)
+    def _heads(self, out: dict):
         heads = [out[n] for n in self.outputs if n != "equities"]
         return heads[0] if len(heads) == 1 else tuple(heads)
+
+    def __call__(self, x):
+        return self._heads(self._run(x))
+
+    @property
+    def background(self) -> bool:
+        """Can this network answer while the search goes on?  See ``start``."""
+        return BACKGROUND and _infer_start is not None
+
+    def start(self, x):
+        """``__call__`` in two halves: the batch goes to the network workers
+        now, and the returned function waits for what ``__call__`` would have
+        returned -- so the search can collect its next batch meanwhile."""
+        wait = _infer_start(self.name, self._planes(x))
+        return lambda: self._heads(self._named(wait()))
 
     forward = __call__
 

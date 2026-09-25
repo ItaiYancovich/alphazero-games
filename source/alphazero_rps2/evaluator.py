@@ -33,8 +33,7 @@ class BatchEvaluator(_CoreEvaluator):
         super().__init__(net, planes_from_boards, device=device, jit=jit,
                          example_shape=(rows, cols))
 
-    @torch.inference_mode()
-    def evaluate(self, states) -> tuple[np.ndarray, np.ndarray]:
+    def _inputs(self, states):
         boards = np.stack([s.canonical_board() for s in states])
         # The search reaches every node by copying the position and playing on
         # the copy, and a copy shares the move history -- so a node deep in the
@@ -43,9 +42,9 @@ class BatchEvaluator(_CoreEvaluator):
         # read zero everywhere in search, which is the blindness they fix.
         reps = np.fromiter((s.repetitions() - 1 for s in states),
                            dtype=np.int64, count=len(states))
-        planes = self.encode(boards, self.in_planes, reps=reps)
-        x = torch.from_numpy(planes).to(self.device)
-        logits, values = self.module(x)
+        return self.encode(boards, self.in_planes, reps=reps), states
+
+    def _outputs(self, states, logits, values) -> tuple[np.ndarray, np.ndarray]:
         mask = np.stack([s.canonical_policy_mask() for s in states])
         logits = logits.masked_fill(torch.from_numpy(~mask).to(self.device), -1e9)
         priors = torch.softmax(logits, dim=1).cpu().numpy().astype(np.float32)

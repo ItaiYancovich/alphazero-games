@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from .mcts import MCTSConfig, Search
+from .mcts import MCTSConfig, Search, run_search
 from .state import GameState
 
 if TYPE_CHECKING:  # only for the annotations below
@@ -98,12 +98,7 @@ class AlphaZeroAgent(Agent):
         search = Search(board.copy(), self.cfg, self.rng)
         # Gather several leaves per network call using virtual loss; a batch of
         # one leaves most of the CPU idle.
-        while search.sims_done < self.cfg.simulations:
-            states = search.next_leaf_batch(self.batch_size)
-            if not states:
-                break
-            priors, values = self.evaluator.evaluate(states)
-            search.expand_batch(priors, values)
+        run_search(search, self.evaluator, self.cfg.simulations, self.batch_size)
         # Report the proven result when there is one, so a forced win reads as
         # +1 rather than as an average diluted by unrefuted branches.
         self.last_value = search.root_score()

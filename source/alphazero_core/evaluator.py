@@ -75,13 +75,36 @@ class BatchEvaluator:
             except Exception as exc:
                 import logging
                 logging.getLogger(__name__).warning("OpenVINO GPU evaluation failed (%s); this batch ran on CPU.", exc)
+        planes, context = self._inputs(states)
+        logits, values = self.module(torch.from_numpy(planes).to(self.device))
+        return self._outputs(context, logits, values)
+
+    @property
+    def background(self) -> bool:
+        """Can the network answer while the search goes on?
+
+        Only the web build's can (its network runs in other workers); a search
+        with such an engine keeps a batch in flight -- see ``run_search``.
+        """
+        return self._ov is None and bool(getattr(self.module, "background", False))
+
+    def evaluate_start(self, states: list[GameState]):
+        """Hand ``states`` to the network; returns a function that waits for
+        the answer, as :meth:`evaluate` gives it.  Needs :attr:`background`."""
+        planes, context = self._inputs(states)
+        wait = self.module.start(torch.from_numpy(planes))
+        return lambda: self._outputs(context, *wait())
+
+    def _inputs(self, states: list[GameState]):
+        """The network's input planes for ``states``, and what :meth:`_outputs`
+        needs to turn its answer into priors."""
         # One batched encode rather than one per position: the feature planes
         # are cheap in bulk and dominated by numpy call overhead one at a time.
         boards = np.stack([s.canonical_board() for s in states])
-        planes = self.encode(boards, self.in_planes)
-        x = torch.from_numpy(planes).to(self.device)
-        logits, values = self.module(x)
+        return self.encode(boards, self.in_planes), (boards, states)
 
+    def _outputs(self, context, logits, values) -> tuple[np.ndarray, np.ndarray]:
+        boards, states = context
         # Legality mask, in the same canonical frame the boards are already in.
         # An empty cell is playable in Hex; Connect Four masks further (only the
         # lowest empty cell of a column can be played), which is why the mask is
