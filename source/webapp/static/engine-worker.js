@@ -11,6 +11,10 @@ const CTL_INTS = 64, ROWS = CTL_INTS - 1;
 let jobBlock = null, input = null, output = null;
 let slots = [];            // one per network worker: {ctl, port, warm}
 let netMeta = {};          // models.json
+let gpuSlot = null;        // the GPU worker, if the browser has WebGPU
+const GPU = 2;             // job block: 0 no GPU worker, 1 GPU ready, 2 no GPU after all
+// A GPU that may yet be used: there is a worker for it, and it has not said no.
+const gpuPossible = () => gpuSlot !== null && Atomics.load(jobBlock, GPU) !== 2;
 let py = null, web = null;
 const queue = [];
 let busy = false;
@@ -49,9 +53,10 @@ let jobs = 0;
 // on its own threads, the float network: the site as it always ran -- or
 // "4x2:8": four of the pool, the batch cut into two pieces a worker (more
 // pieces let a worker on a fast core take more of them), the 8-bit network.
+// "gpu:f" is the GPU worker alone, where there is one (see `gpuSlot`).
 function parseChoice(choice) {
   const [setup, p] = choice.split(":");
-  const [k, per] = setup === "old" ? [0, 1] : setup.split("x").map(Number);
+  const [k, per] = setup === "old" ? [0, 1] : setup === "gpu" ? [-1, 1] : setup.split("x").map(Number);
   return { setup, k, per, variant: p === "8" ? "int8" : "float" };
 }
 
@@ -60,10 +65,10 @@ function begin(choice, model, flat, dims) {
   const n = dims[0];
   if (whole.has(model)) choice = "old:" + (choice.split(":")[1] || "f");
   const { k, per, variant } = parseChoice(choice);
-  const team = k === 0 ? [slots[0]] : slots.slice(1, 1 + Math.min(k, n));
+  const team = teamOf(choice, n);
   if (flat.length > input.length) throw new Error("input too large for the shared buffer");
   input.set(flat, 0);
-  const chunk = k === 0 ? n : Math.max(1, Math.ceil(n / (team.length * per)));
+  const chunk = k <= 0 ? n : Math.max(1, Math.ceil(n / (team.length * per)));
   const id = ++jobs;
   Atomics.store(jobBlock, 1, 0);
   Atomics.store(jobBlock, 0, id);
@@ -88,6 +93,14 @@ function end(job) {
   Atomics.store(jobBlock, 0, 0);            // anyone still at it: stop
   const lost = states.indexOf(3);
   if (lost >= 0 && team[lost] === slots[0]) throw new Error("the network failed");
+  if (lost >= 0 && team[lost] === gpuSlot) {
+    // The GPU failed (lost, or a network it cannot run): the CPU carries on.
+    console.warn("the GPU worker failed; the networks run on the CPU from now on");
+    Atomics.store(jobBlock, GPU, 2);
+    gpuSlot = null;
+    for (const key of Object.keys(learned)) delete learned[key];
+    return end(begin(`old:${variant === "int8" ? "8" : "f"}`, model, flat, dims));
+  }
   if (lost >= 0) {
     // A worker of the pool failed: carry on without it and every one after it.
     const at = slots.indexOf(team[lost]);
@@ -133,30 +146,46 @@ function end(job) {
 // * Then how many workers: every setup at that precision is timed on a few
 //   real batches, taking turns so a device warming up or slowing down is fair
 //   to all, and the fastest is used from then on.  "old:f" -- the site as it
-//   was -- is always one of them, so the result is never slower than that.
+//   was -- is always one of them, so the result is never slower than that;
+//   so is "gpu:f", the float network on the graphics card, where the browser
+//   has WebGPU.
 //
 // Now and then a runner-up is timed again, since a phone slows down as it
 // heats up.  The page keeps what was learned for the next visit.
-const TUNING_VERSION = 5;
+const TUNING_VERSION = 6;
 const SAMPLES = 5;         // calls to time a choice on before judging it
 const MARGIN = 0.97;       // how much faster a choice must be to take over the best
 const RECHECK = 25;        // calls between second looks at a runner-up
 const WARMUP = 2;          // a worker's first calls on a network load and settle it
+const REJECT = 3;          // this many times slower than the best so far: tried enough
 let setups = ["old"];      // "old", then the pool's: "2x1", ..., "8x2"
 const learned = {};        // "model|8" -> see `entry`
 
 const hasInt8 = model => !!(netMeta[model] && netMeta[model].float_file);
 
-// The setups to try at precision `p` ("f" or "8"), with the old float one.
-function spreadChoices(p) {
-  return [...new Set(["old:f", ...setups.map(s => `${s}:${p}`)])];
+// The setups to try at precision `p` ("f" or "8"), with the old float one,
+// and the GPU (float) where there is one and it is still in the running for
+// this network and batch size.
+function spreadChoices(p, key) {
+  const gpu = gpuPossible() && !(key && gpuBeaten(key));
+  return [...new Set(["old:f", ...setups.map(s => `${s}:${p}`), ...(gpu ? ["gpu:f"] : [])])];
 }
 
-function entry(model) {
+// Where the GPU lost badly -- far slower than the CPU -- it is not tried again
+// for that network at that batch size or any smaller one: a GPU's fixed cost
+// a call weighs most on small batches, so only a bigger batch might still go
+// its way.  model -> the largest batch size it lost at.
+const gpuLost = {};
+function gpuBeaten(key) {
+  const [model, size] = key.split("|");
+  return gpuLost[model] !== undefined && Number(size) <= gpuLost[model];
+}
+
+function entry(model, key) {
   const both = hasInt8(model) && setups.length > 1;
   return {
     prec: both ? null : "f", // "f" / "8" once chosen; null while comparing
-    candidates: both ? ["old:f", "old:8"] : spreadChoices("f"),
+    candidates: both ? ["old:f", "old:8"] : spreadChoices("f", key),
     best: null,              // the choice in use, once every candidate has been timed
     trying: null,            // a runner-up being timed again, if any
     saved: false,            // told the page
@@ -172,11 +201,13 @@ function setTuning(saved) {
   // Two pieces a worker only where there are enough workers for some to be
   // on slow cores.
   setups = ["old", ...sizes.map(k => `${k}x1`), ...sizes.filter(k => k >= 4).map(k => `${k}x2`)];
-  if (!saved || saved.version !== TUNING_VERSION || saved.workers !== pool) return;
+  if (!saved || saved.version !== TUNING_VERSION || saved.workers !== pool
+      || !!saved.gpu !== (gpuSlot !== null)) return;
+  Object.assign(gpuLost, saved.gpuLost || {});
   for (const [key, { best, prec, ms }] of Object.entries(saved.learned || {})) {
-    const L = learned[key] = entry(key.split("|")[0]);
+    const L = learned[key] = entry(key.split("|")[0], key);
     L.prec = prec;
-    L.candidates = spreadChoices(prec);
+    L.candidates = spreadChoices(prec, key);
     if (!L.candidates.includes(best)) { delete learned[key]; continue; }
     L.best = best;
     L.saved = true;
@@ -201,11 +232,24 @@ function typical(list) {
 
 const timed = (L, c) => (L.times[c] || []).length;
 
+// bench.html's raw network timing: every call made one way, and not learned from.
+let forced = "";
+self.benchChoice = choice => { forced = choice || ""; };
+self.benchInfo = () => JSON.stringify({ pool: slots.length - 1, gpu: gpuPossible() && gpuSlot !== null
+                                        && Atomics.load(jobBlock, GPU) === 1 });
+
 function choiceFor(model, rows) {
-  if (setups.length < 2 || rows < 2 || whole.has(model)) return { choice: "old:f" };
+  if (forced) return { choice: forced };
+  if ((setups.length < 2 && !gpuPossible()) || rows < 2 || whole.has(model)) return { choice: "old:f" };
   const key = `${model}|${sizeOf(rows)}`;
-  const L = learned[key] || (learned[key] = entry(model));
+  const L = learned[key] || (learned[key] = entry(model, key));
   L.calls++;
+  if ((!gpuPossible() || gpuBeaten(key)) && L.candidates.includes("gpu:f") && L.best === null) {
+    // No GPU after all (no adapter), or it lost here already: without it.
+    L.candidates = L.candidates.filter(c => c !== "gpu:f");
+    if (L.best === "gpu:f") L.best = null;
+    if (L.trying === "gpu:f") L.trying = null;
+  }
   if (L.best === null) {
     // Every candidate in turn, the least timed first.
     const fewest = Math.min(...L.candidates.map(c => timed(L, c)));
@@ -234,11 +278,22 @@ function record(key, choice, ms, rows) {
   if (list.length > SAMPLES) list.shift();
   let changed = false;
   if (L.best === null) {
+    // A choice far slower than the best seen so far is not worth four more
+    // tries: a weak GPU, say, can be a hundred times slower than the CPU.
+    const others = L.candidates.filter(c => c !== choice && timed(L, c));
+    const fastest = Math.min(...others.map(c => typical(L.times[c])));
+    if (list.length < SAMPLES && ms / rows > REJECT * fastest) {
+      while (list.length < SAMPLES) list.push(ms / rows);
+      if (choice === "gpu:f") {
+        const [model, size] = key.split("|");
+        gpuLost[model] = Math.max(gpuLost[model] || 0, Number(size));
+      }
+    }
     if (L.candidates.some(c => timed(L, c) < SAMPLES)) return;
     if (L.prec === null) {
       // Precision decided; on to how many workers, at that precision.
       L.prec = typical(L.times["old:8"]) < typical(L.times["old:f"]) ? "8" : "f";
-      L.candidates = spreadChoices(L.prec);
+      L.candidates = spreadChoices(L.prec, key);
       return;
     }
     L.best = L.candidates.reduce((a, b) => (typical(L.times[b]) < typical(L.times[a]) ? b : a));
@@ -263,8 +318,13 @@ function tuningNow() {
       ms: Object.fromEntries(seen.map(c => [c, +typical(L.times[c]).toFixed(3)])),
     };
   }
-  return { version: TUNING_VERSION, workers: slots.length - 1, learned: out };
+  return { version: TUNING_VERSION, workers: slots.length - 1, gpu: gpuSlot !== null, gpuLost, learned: out };
 }
+
+// Has this device's tuning put `model` on the GPU?  (The v3 bot asks: on a
+// GPU it searches with the desktop's bigger batches.)
+self.gpuBest = model => Object.entries(learned).some(
+  ([key, L]) => key.startsWith(`${model}|`) && L.best === "gpu:f");
 
 const counters = { calls: 0, rows: 0, ms: 0, waitedMs: 0 };    // read by bench.html
 self.inferStats = counters;
@@ -306,6 +366,7 @@ function inferSync(model, flat, dims) {
 
 function teamOf(choice, rows) {
   const { k } = parseChoice(choice);
+  if (k < 0) return gpuSlot ? [gpuSlot] : [slots[0]];
   return k === 0 ? [slots[0]] : slots.slice(1, 1 + Math.min(k, rows));
 }
 
@@ -371,6 +432,8 @@ async function boot(msg) {
     port,
     warm: {},                // network -> calls this worker has answered
   }));
+  // The GPU worker, when there is one, is last: kept apart from the CPU ones.
+  if (layout.gpu >= 0) gpuSlot = slots.splice(layout.gpu, 1)[0];
   setTuning(msg.tuning);
   progress("python", "Starting Python");
   const core = loadUttt();

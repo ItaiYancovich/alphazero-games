@@ -123,10 +123,12 @@ VENDOR = {
                 ("pyodide.js", "pyodide.asm.js", "pyodide.asm.wasm",
                  "python_stdlib.zip", "pyodide-lock.json")]
                + [DEV / "vendor/numpy-2.0.2-cp312-cp312-pyodide_2024_0_wasm32.whl"],
-    # onnxruntime-web, CPU (WASM) backend only.
+    # onnxruntime-web: the CPU (WASM) build, and the WebGPU build the GPU
+    # worker loads (its .jsep files are the WebAssembly half of it).
     "ort": [DEV / "node_modules/onnxruntime-web/dist" / name for name in
             ("ort.wasm.min.mjs", "ort-wasm-simd-threaded.mjs",
-             "ort-wasm-simd-threaded.wasm")],
+             "ort-wasm-simd-threaded.wasm", "ort.webgpu.min.mjs",
+             "ort-wasm-simd-threaded.jsep.mjs", "ort-wasm-simd-threaded.jsep.wasm")],
     # Signing for the relay messages of online play (Unlicense).
     "": [DEV / "node_modules/nostr-tools/lib/nostr.bundle.js"],
 }
