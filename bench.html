@@ -80,7 +80,9 @@
 
   <div class="card scroll" id="nets-card" hidden>
     <p>Each network on its own: milliseconds per position (lower is better), CPU — the
-       fastest of the old setup and the pool — against the GPU, at two batch sizes.</p>
+       fastest of the old setup and the pool — against the GPU — the fastest of the GPU
+       alone (full or half precision) and the GPU sharing the batch with the CPU — at two
+       batch sizes.</p>
     <table id="nets"></table>
   </div>
 
@@ -165,18 +167,28 @@ for name in ["hex", "c4", "uttt", "rps2", "uttt_v3"]:
     if info["pool"] > 1:
         ways += [f"{info['pool']}x1:f"] + ([f"{info['pool']}x1:8"] if meta.get("float_file") else [])
     if info["gpu"]:
-        ways += ["gpu:f"]
+        gpus = ["f"] + (["h"] if info["half"] and meta.get("gpu16_file") else [])
+        ways += [f"gpu:{g}" for g in gpus]
+        if info["pool"] > 1:
+            cpu = "8" if meta.get("float_file") else "f"
+            ways += [f"mix:{g}{cpu}" for g in gpus]
     res = {}
+    xs = {n: (rng.random((n, *meta["input_shape"])) < 0.3).astype(np.float32) for n in (8, 16, 48, 128)}
+    ref = {}
     for way in ways:
         js.benchChoice(way)
-        for n in (8, 16, 48, 128):
-            x = (rng.random((n, *meta["input_shape"])) < 0.3).astype(np.float32)
+        for n, x in xs.items():
             for _ in range(2):
-                W._infer(name, x)
+                first = W._infer(name, x)
             t = time.perf_counter()
             for _ in range(3):
                 W._infer(name, x)
             res[f"{way} b{n}"] = round(1000 * (time.perf_counter() - t) / 3 / n, 3)
+            # How far the GPU's answers are from the float CPU's.
+            if way == "old:f":
+                ref[n] = first[1]
+            elif way.startswith(("gpu", "mix")):
+                res[f"{way} b{n} value_diff"] = round(float(np.abs(first[1] - ref[n]).max()), 5)
     out[name] = res
 js.benchChoice("")
 json.dumps(out)
@@ -347,12 +359,13 @@ function render() {
       + `Learned spreads: ${picks || "none yet"}.`;
   }
   if (results.networks) {
-    const fmt = v => (v == null ? "–" : v.toFixed(2));
+    const fmt = v => (v == null || !isFinite(v) ? "–" : v.toFixed(2));
     let rows = "<tr><th>Network</th><th>CPU ×48</th><th>GPU ×48</th><th>CPU ×128</th><th>GPU ×128</th></tr>";
     for (const [name, r] of Object.entries(results.networks)) {
-      const cpu = n => Math.min(...Object.entries(r).filter(([k]) => !k.startsWith("gpu") && k.endsWith(` b${n}`)).map(([, v]) => v));
-      rows += `<tr><td>${name}</td><td>${fmt(cpu(48))}</td><td>${fmt(r["gpu:f b48"])}</td>`
-        + `<td>${fmt(cpu(128))}</td><td>${fmt(r["gpu:f b128"])}</td></tr>`;
+      const best = (n, gpu) => Math.min(...Object.entries(r)
+        .filter(([k]) => /^(gpu|mix)/.test(k) === gpu && k.endsWith(` b${n}`)).map(([, v]) => v));
+      rows += `<tr><td>${name}</td><td>${fmt(best(48, false))}</td><td>${fmt(best(48, true))}</td>`
+        + `<td>${fmt(best(128, false))}</td><td>${fmt(best(128, true))}</td></tr>`;
     }
     $("nets").innerHTML = rows;
     $("nets-card").hidden = false;

@@ -171,7 +171,19 @@
    "in_planes": 23,
    "version": 3
   },
-  "ckpt": "best.pt"
+  "ckpt": "best.pt",
+  "gpu_file": "models/uttt_v3_gpu.onnx",
+  "gpu16_file": "models/uttt_v3_gpu16.onnx",
+  "gpu_check": {
+   "float": {
+    "top_move_same": 1.0,
+    "value_diff_max": 3e-06
+   },
+   "half": {
+    "top_move_same": 0.9961,
+    "value_diff_max": 0.005951
+   }
+  }
  },
  "splendor3": {
   "file": "models/splendor3.onnx",

@@ -5,7 +5,7 @@
 // between, does the work the desktop server did on its threads -- the bots'
 // moves, the live analysis and the match review -- one step at a time, so a
 // request never waits behind more than one step.
-importScripts("pyodide/pyodide.js");
+importScripts("pyodide/pyodide.js", "uttt-core.js");
 
 const CTL_INTS = 64, ROWS = CTL_INTS - 1;
 let jobBlock = null, input = null, output = null;
@@ -13,6 +13,7 @@ let slots = [];            // one per network worker: {ctl, port, warm}
 let netMeta = {};          // models.json
 let gpuSlot = null;        // the GPU worker, if the browser has WebGPU
 const GPU = 2;             // job block: 0 no GPU worker, 1 GPU ready, 2 no GPU after all
+const HALF = 3;            // job block: 1 when the GPU runs half precision
 // A GPU that may yet be used: there is a worker for it, and it has not said no.
 const gpuPossible = () => gpuSlot !== null && Atomics.load(jobBlock, GPU) !== 2;
 let py = null, web = null;
@@ -33,13 +34,16 @@ let pumpTimer = null;
 // Wait for one worker to finish its part.  The extra workers get a deadline:
 // one that died (a phone out of memory, say) would otherwise be waited for
 // forever.
-const DEADLINE = 30000;
+// The GPU worker gets longer: its first call at a batch size sets up a session
+// for it (see ort-worker.js), which on a slow GPU takes a while.
+const DEADLINE = 30000, GPU_DEADLINE = 180000;
 function finished(slot, patient) {
   const { ctl } = slot;
   const t0 = performance.now();
+  const limit = slot === gpuSlot ? GPU_DEADLINE : DEADLINE;
   while (Atomics.load(ctl, 0) === 1) {
     Atomics.wait(ctl, 0, 1, 2000);
-    if (!patient && performance.now() - t0 > DEADLINE) return 3;
+    if (!patient && performance.now() - t0 > limit) return 3;
   }
   const state = Atomics.load(ctl, 0);
   Atomics.store(ctl, 0, 0);
@@ -53,31 +57,70 @@ let jobs = 0;
 // on its own threads, the float network: the site as it always ran -- or
 // "4x2:8": four of the pool, the batch cut into two pieces a worker (more
 // pieces let a worker on a fast core take more of them), the 8-bit network.
-// "gpu:f" is the GPU worker alone, where there is one (see `gpuSlot`).
+// Where there is a GPU worker (see `gpuSlot`): "gpu:f" is it alone, float;
+// "gpu:h" alone, half precision; "mix:h8" splits the batch between it (half)
+// and the whole CPU pool (8-bit) -- the GPU takes a share of the positions,
+// sized by how fast each side is (`share`), and the pool the rest.
 function parseChoice(choice) {
   const [setup, p] = choice.split(":");
-  const [k, per] = setup === "old" ? [0, 1] : setup === "gpu" ? [-1, 1] : setup.split("x").map(Number);
-  return { setup, k, per, variant: p === "8" ? "int8" : "float" };
+  const cpu = v => (v === "8" ? "int8" : "float");
+  if (setup === "gpu") return { setup, k: -1, per: 1, variant: p === "h" ? "half" : "float" };
+  if (setup === "mix") {
+    return { setup, k: -2, per: 2, variant: cpu(p[1]), gpuVariant: p[0] === "h" ? "half" : "float" };
+  }
+  const [k, per] = setup === "old" ? [0, 1] : setup.split("x").map(Number);
+  return { setup, k, per, variant: cpu(p) };
 }
 
+// On the GPU a batch is rounded up (see ort-worker.js); each size is set up
+// the first time it is seen, so warming up counts sizes there.
+const gpuPad = rows => (rows <= 128 ? Math.max(16, 2 ** Math.ceil(Math.log2(rows))) : Math.ceil(rows / 64) * 64);
+
+// Who does what with a batch of `n`: [{slot, variant, first, count}] (first
+// and count only for a fixed share), where the counter starts, and the size
+// of each take from it.
+function planOf(choice, n, share = 0.5) {
+  const c = parseChoice(choice);
+  if (c.k === 0 || (c.k < 0 && !gpuSlot)) {
+    return { parts: [{ slot: slots[0], variant: c.variant }], start: 0, chunk: n };
+  }
+  if (c.k === -1) return { parts: [{ slot: gpuSlot, variant: c.variant }], start: 0, chunk: n };
+  if (c.k === -2) {
+    const pool = slots.slice(1);
+    const m = pool.length && n > 1 ? Math.min(n - 1, Math.max(1, Math.round(n * share))) : n;
+    const parts = [{ slot: gpuSlot, variant: c.gpuVariant, first: 0, count: m }];
+    const rest = pool.slice(0, n - m);
+    for (const slot of rest) parts.push({ slot, variant: c.variant });
+    return { parts, start: m, chunk: Math.max(1, Math.ceil((n - m) / Math.max(1, rest.length * c.per))) };
+  }
+  const team = slots.slice(1, 1 + Math.min(c.k, n));
+  return { parts: team.map(slot => ({ slot, variant: c.variant })), start: 0,
+           chunk: Math.max(1, Math.ceil(n / (team.length * c.per))) };
+}
+
+// The key a part warms: a model and variant, and on the GPU the batch size.
+const warmKey = (part, model, n) =>
+  part.slot === gpuSlot ? `${model}:${part.variant}:${gpuPad(part.count ?? n)}` : `${model}:${part.variant}`;
+
 // Hand a batch to the network workers; returns the job, for `end`.
-function begin(choice, model, flat, dims) {
+function begin(choice, model, flat, dims, share) {
   const n = dims[0];
-  if (whole.has(model)) choice = "old:" + (choice.split(":")[1] || "f");
-  const { k, per, variant } = parseChoice(choice);
-  const team = teamOf(choice, n);
+  if (whole.has(model)) choice = "old:" + (choice.split(":")[1] || "f").slice(-1).replace("h", "f");
+  const { k, variant } = parseChoice(choice);
+  const plan = planOf(choice, n, share);
+  const team = plan.parts.map(p => p.slot);
   if (flat.length > input.length) throw new Error("input too large for the shared buffer");
   input.set(flat, 0);
-  const chunk = k <= 0 ? n : Math.max(1, Math.ceil(n / (team.length * per)));
   const id = ++jobs;
-  Atomics.store(jobBlock, 1, 0);
+  Atomics.store(jobBlock, 1, plan.start);
   Atomics.store(jobBlock, 0, id);
-  for (const slot of team) {
-    Atomics.store(slot.ctl, 0, 1);
-    slot.ctl[ROWS] = 0;
-    slot.port.postMessage({ id, model, variant, dims: Array.from(dims), n, chunk });
+  for (const part of plan.parts) {
+    Atomics.store(part.slot.ctl, 0, 1);
+    part.slot.ctl[ROWS] = 0;
+    part.slot.port.postMessage({ id, model, variant: part.variant, dims: Array.from(dims), n,
+                                 chunk: plan.chunk, first: part.first, count: part.count });
   }
-  return { choice, model, variant, flat, dims, k, team, t0: performance.now(), waited: false, ms: 0 };
+  return { choice, model, variant, flat, dims, k, team, plan, t0: performance.now(), waited: false, ms: 0 };
 }
 
 // Wait for a job's answers.  `job.waited` says whether there was anything to
@@ -125,7 +168,7 @@ function end(job) {
   for (let i = 0; i < ctl[1]; i++) {
     const shape = [];
     for (let j = 0; j < ctl[2 + i * 5]; j++) shape.push(ctl[3 + i * 5 + j]);
-    if (k > 0) shape[0] = n;
+    if (k > 0 || k === -2) shape[0] = n;       // the pieces of a shared batch, joined
     const size = shape.reduce((a, b) => a * b, 1);
     outs.push({ data: output.slice(at, at + size), dims: shape });
     at += size;
@@ -168,7 +211,24 @@ const hasInt8 = model => !!(netMeta[model] && netMeta[model].float_file);
 // this network and batch size.
 function spreadChoices(p, key) {
   const gpu = gpuPossible() && !(key && gpuBeaten(key));
-  return [...new Set(["old:f", ...setups.map(s => `${s}:${p}`), ...(gpu ? ["gpu:f"] : [])])];
+  const model = key ? key.split("|")[0] : "";
+  const half = gpuHalf() && !!(netMeta[model] && netMeta[model].gpu16_file);
+  const gpus = !gpu ? [] : half ? ["f", "h"] : ["f"];
+  const mixes = setups.length > 1 ? gpus.map(g => `mix:${g}${p}`) : [];
+  return [...new Set(["old:f", ...setups.map(s => `${s}:${p}`), ...gpus.map(g => `gpu:${g}`), ...mixes])];
+}
+
+const gpuHalf = () => gpuSlot !== null && Atomics.load(jobBlock, HALF) === 1;
+
+// The GPU's share of a split batch: in proportion to its speed against the
+// CPU pool's, as timed so far (half and half until both are).
+function shareFor(L, choice) {
+  const { gpuVariant, variant } = parseChoice(choice);
+  const g = typical(L.times[`gpu:${gpuVariant === "half" ? "h" : "f"}`]);
+  const p = variant === "int8" ? "8" : "f";
+  const pools = L.candidates.filter(c => new RegExp(`^\\d+x\\d:${p}$`).test(c));
+  const c = Math.min(...pools.map(x => typical(L.times[x])));
+  return isFinite(g) && isFinite(c) ? c / (c + g) : 0.5;
 }
 
 // Where the GPU lost badly -- far slower than the CPU -- it is not tried again
@@ -236,7 +296,7 @@ const timed = (L, c) => (L.times[c] || []).length;
 let forced = "";
 self.benchChoice = choice => { forced = choice || ""; };
 self.benchInfo = () => JSON.stringify({ pool: slots.length - 1, gpu: gpuPossible() && gpuSlot !== null
-                                        && Atomics.load(jobBlock, GPU) === 1 });
+                                        && Atomics.load(jobBlock, GPU) === 1, half: gpuHalf() });
 
 function choiceFor(model, rows) {
   if (forced) return { choice: forced };
@@ -244,11 +304,11 @@ function choiceFor(model, rows) {
   const key = `${model}|${sizeOf(rows)}`;
   const L = learned[key] || (learned[key] = entry(model, key));
   L.calls++;
-  if ((!gpuPossible() || gpuBeaten(key)) && L.candidates.includes("gpu:f") && L.best === null) {
+  const onGpu = c => /^(gpu|mix):/.test(c);
+  if ((!gpuPossible() || gpuBeaten(key)) && L.candidates.some(onGpu) && L.best === null) {
     // No GPU after all (no adapter), or it lost here already: without it.
-    L.candidates = L.candidates.filter(c => c !== "gpu:f");
-    if (L.best === "gpu:f") L.best = null;
-    if (L.trying === "gpu:f") L.trying = null;
+    L.candidates = L.candidates.filter(c => !onGpu(c));
+    if (L.trying && onGpu(L.trying)) L.trying = null;
   }
   if (L.best === null) {
     // Every candidate in turn, the least timed first.
@@ -284,7 +344,7 @@ function record(key, choice, ms, rows) {
     const fastest = Math.min(...others.map(c => typical(L.times[c])));
     if (list.length < SAMPLES && ms / rows > REJECT * fastest) {
       while (list.length < SAMPLES) list.push(ms / rows);
-      if (choice === "gpu:f") {
+      if (choice.startsWith("gpu:")) {
         const [model, size] = key.split("|");
         gpuLost[model] = Math.max(gpuLost[model] || 0, Number(size));
       }
@@ -324,7 +384,61 @@ function tuningNow() {
 // Has this device's tuning put `model` on the GPU?  (The v3 bot asks: on a
 // GPU it searches with the desktop's bigger batches.)
 self.gpuBest = model => Object.entries(learned).some(
-  ([key, L]) => key.startsWith(`${model}|`) && L.best === "gpu:f");
+  ([key, L]) => key.startsWith(`${model}|`) && /^(gpu|mix):/.test(L.best || ""));
+
+// ------------------------------------------------------------ the solver
+// The v3 bot's exact solver runs on a worker of its own (solver-worker.js,
+// made by pool.js); webgui.py's RemoteSolver reaches it through these.
+// `solverCall` asks and waits for the answer; `solverStart` sets a long solve
+// going and returns, `solverPoll` looks for its answer between search batches,
+// and `solverStop` cancels it and takes whatever it proved.  Answers come
+// back as JSON text.
+let solver = null;         // {ctl, bytes, port}
+let solverSeq = 0, solverJob = 0;
+
+function solverSend(req) {
+  const id = ++solverSeq;
+  Atomics.store(solver.ctl, 3, 0);
+  Atomics.store(solver.ctl, 1, id);
+  Atomics.store(solver.ctl, 0, 1);
+  solver.port.postMessage({ id, req });
+  return id;
+}
+
+function solverAnswer(id) {
+  const { ctl, bytes } = solver;
+  if (Atomics.load(ctl, 1) !== id || Atomics.load(ctl, 0) === 1) return null;
+  if (Atomics.load(ctl, 0) === 3) throw new Error("the solver failed");
+  return new TextDecoder().decode(bytes.slice(0, ctl[2]));
+}
+
+function solverWait(id, ms) {
+  const { ctl } = solver;
+  const t0 = performance.now();
+  while (Atomics.load(ctl, 1) === id && Atomics.load(ctl, 0) === 1) {
+    const left = ms - (performance.now() - t0);
+    if (left <= 0) break;
+    Atomics.wait(ctl, 0, 1, Math.min(left, 1000));
+  }
+}
+
+self.solverReady = () => solver !== null;
+self.solverCall = json => {
+  if (solverJob) self.solverStop(solverJob, 2000);
+  const id = solverSend(JSON.parse(json));
+  solverWait(id, 600000);
+  return solverAnswer(id);
+};
+self.solverStart = json => (solverJob = solverSend(JSON.parse(json)));
+self.solverPoll = id => solverAnswer(id);
+self.solverStop = (id, waitMs) => {
+  if (Atomics.load(solver.ctl, 1) === id) {
+    Atomics.store(solver.ctl, 3, id);
+    solverWait(id, waitMs);
+  }
+  if (solverJob === id) solverJob = 0;
+  return solverAnswer(id);
+};
 
 const counters = { calls: 0, rows: 0, ms: 0, waitedMs: 0 };    // read by bench.html
 self.inferStats = counters;
@@ -338,18 +452,22 @@ let pending = null;
 function inferStart(model, flat, dims) {
   if (pending) throw new Error("a batch is already with the network");
   const { choice, key } = choiceFor(model, dims[0]);
-  // A worker's first calls on a network load it: not a time to learn from.
-  const warm = `${model}:${parseChoice(choice).variant}`;
-  const cold = teamOf(choice, dims[0]).some(s => (s.warm[warm] || 0) < WARMUP);
-  pending = { job: begin(choice, model, flat, dims), key, cold };
+  const share = key && choice.startsWith("mix:") ? shareFor(learned[key], choice) : 0.5;
+  const job = begin(choice, model, flat, dims, share);
+  // A worker's first calls on a network (and the GPU's on a batch size) set
+  // it up: not a time to learn from.
+  const cold = job.plan.parts.some(p => (p.slot.warm[warmKey(p, model, dims[0])] || 0) < WARMUP);
+  pending = { job, key, cold };
 }
 
 function inferFinish() {
   const { job, key, cold } = pending;
   pending = null;
   const outs = end(job);
-  const warm = `${job.model}:${job.variant}`;
-  job.team.forEach(s => { s.warm[warm] = (s.warm[warm] || 0) + 1; });
+  for (const p of job.plan.parts) {
+    const w = warmKey(p, job.model, job.dims[0]);
+    p.slot.warm[w] = (p.slot.warm[w] || 0) + 1;
+  }
   // Only a batch the search had to wait for says how long the network takes.
   if (key && !cold && job.waited) record(key, job.choice, job.ms, job.dims[0]);
   counters.calls++;
@@ -365,56 +483,16 @@ function inferSync(model, flat, dims) {
 }
 
 function teamOf(choice, rows) {
-  const { k } = parseChoice(choice);
-  if (k < 0) return gpuSlot ? [gpuSlot] : [slots[0]];
-  return k === 0 ? [slots[0]] : slots.slice(1, 1 + Math.min(k, rows));
+  return planOf(choice, rows).parts.map(p => p.slot);
 }
 
 const progress = (stage, detail) => self.postMessage({ type: "progress", stage, detail });
 
 // ------------------------------------------------- the native UTTT core
-// `uttt_rs` -- the Rust search behind Ultimate Tic-Tac-Toe's v3 bot -- built
-// for WASI (webapp/uttt_wasm).  It asks the host for six things: the time
-// (its solver runs on a clock), random bytes (for its hash tables), and four
-// it never really uses.  Python reaches the exports as `js.utttWasm`.
+// See uttt-core.js.  Python reaches the exports as `js.utttWasm`.
 async function loadUttt() {
-  let memory = null;
-  const view = () => new DataView(memory.buffer);
-  const wasi = {
-    clock_time_get(_id, _precision, out) {
-      const ns = BigInt(Math.round((performance.timeOrigin + performance.now()) * 1e6));
-      view().setBigUint64(out, ns, true);
-      return 0;
-    },
-    random_get(ptr, len) {
-      crypto.getRandomValues(new Uint8Array(memory.buffer, ptr, len));
-      return 0;
-    },
-    environ_sizes_get(count, size) {
-      view().setUint32(count, 0, true);
-      view().setUint32(size, 0, true);
-      return 0;
-    },
-    environ_get() { return 0; },
-    fd_write(_fd, iovs, n, written) {
-      const dv = view();
-      let text = "", total = 0;
-      for (let i = 0; i < n; i++) {
-        const ptr = dv.getUint32(iovs + i * 8, true), len = dv.getUint32(iovs + i * 8 + 4, true);
-        text += new TextDecoder().decode(new Uint8Array(memory.buffer, ptr, len));
-        total += len;
-      }
-      if (text.trim()) console.log("[uttt core]", text.trim());
-      dv.setUint32(written, total, true);
-      return 0;
-    },
-    proc_exit(code) { throw new Error(`the UTTT core stopped (${code})`); },
-  };
   try {
-    const bytes = await (await fetch("uttt_wasm.wasm")).arrayBuffer();
-    const { instance } = await WebAssembly.instantiate(bytes, { wasi_snapshot_preview1: wasi });
-    memory = instance.exports.memory;
-    self.utttWasm = instance.exports;
+    self.utttWasm = await instantiateUttt();
   } catch (err) {
     // Only the v3 bot needs it; every other game and bot runs without.
     console.warn("UTTT core unavailable:", err);
@@ -424,6 +502,10 @@ async function loadUttt() {
 async function boot(msg) {
   const { sab, layout } = msg;
   netMeta = msg.models;
+  if (msg.solver) {
+    solver = { ctl: new Int32Array(msg.solver.sab, 0, 16),
+               bytes: new Uint8Array(msg.solver.sab, 64), port: msg.solver.port };
+  }
   jobBlock = new Int32Array(sab, layout.job, 16);
   input = new Float32Array(sab, layout.input, layout.inputFloats);
   output = new Float32Array(sab, layout.output, layout.outputFloats);

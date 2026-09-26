@@ -28,8 +28,9 @@
 
 const CTL_INTS = 64, ROWS = CTL_INTS - 1;
 const GPU = 2;             // job block: 0 no GPU worker, 1 GPU ready, 2 no GPU after all
+const HALF = 3;            // job block: 1 when the GPU runs half precision
 let job = null, ctl = null, input = null, output = null, models = null;
-let ort = null, provider = "wasm";
+let ort = null, provider = "wasm", gpuHalf = false;
 let started = null;        // resolves once onnxruntime is loaded
 const sessions = {};
 
@@ -48,6 +49,8 @@ async function load(backend, threads, force) {
         && !force) {
       throw new Error("only a software GPU");
     }
+    // onnxruntime asks for 16-bit shaders whenever the adapter has them.
+    gpuHalf = adapter.features.has("shader-f16");
     ort = await import("./ort/ort.webgpu.min.mjs");
     provider = "webgpu";
   } else {
@@ -64,66 +67,137 @@ async function load(backend, threads, force) {
 
 // A network with an 8-bit version has two files: `file` (8-bit) and
 // `float_file`.  Which is faster depends on the device, and the engine decides
-// (the tuning in engine-worker.js); `variant` names the one to run.
+// (the tuning in engine-worker.js); `variant` names the one to run.  The GPU
+// runs float ("float") or half precision ("half"), from the files made for it
+// where there are any (models.json `gpu_file`, `gpu16_file`; gpu_models.py).
 function fileOf(name, variant) {
   const m = models[name];
+  if (provider === "webgpu") {
+    if (variant === "half" && m.gpu16_file) return m.gpu16_file;
+    return m.gpu_file || m.float_file || m.file;
+  }
   return variant === "float" && m.float_file ? m.float_file : m.file;
+}
+
+const files = {};
+function bytesOf(file) {
+  if (!files[file]) {
+    files[file] = fetch(new URL("./" + file, import.meta.url))
+      .then(r => r.arrayBuffer()).then(b => new Uint8Array(b));
+  }
+  return files[file];
 }
 
 function session(name, variant) {
   const key = `${name}:${fileOf(name, variant)}`;
   if (!sessions[key]) {
-    sessions[key] = (async () => {
-      const url = new URL("./" + fileOf(name, variant), import.meta.url);
-      const bytes = new Uint8Array(await (await fetch(url)).arrayBuffer());
-      return ort.InferenceSession.create(bytes, {
-        executionProviders: [provider], graphOptimizationLevel: "all",
-      });
-    })();
+    sessions[key] = bytesOf(fileOf(name, variant)).then(bytes => ort.InferenceSession.create(bytes, {
+      executionProviders: [provider], graphOptimizationLevel: "all",
+    }));
   }
   return sessions[key];
 }
 
 // On the GPU, every new batch size can mean compiling new shaders -- slow, and
 // the bots' batches come in every size.  So the GPU runs batches rounded up
-// to a few sizes (8, 16, 32, 64, then multiples of 32), padded with empty
-// positions whose answers are dropped.  A network whose outputs do not lead
-// with the batch cannot be cut back, and runs as it comes.
-const unpadded = new Set();
-const padTo = rows => (rows <= 64 ? Math.max(8, 2 ** Math.ceil(Math.log2(rows))) : Math.ceil(rows / 32) * 32);
+// to a few sizes (16, 32, 64, 128, then multiples of 64), padded with empty
+// positions whose answers are dropped.  (engine-worker.js's `gpuPad` agrees.)
+//
+// Each size gets a session of its own with the batch fixed, and graph capture:
+// the first run is recorded and the rest replay it, which saves the GPU the
+// overhead of setting up each of a network's many small steps every time.
+// The input stays in one GPU buffer, rewritten each call, as capture needs.
+// Where capture is refused (a step the GPU cannot run), the size falls back
+// to one ordinary session for all sizes.
+const unpadded = new Set();  // networks whose outputs do not lead with the batch
+const padTo = rows => (rows <= 128 ? Math.max(16, 2 ** Math.ceil(Math.log2(rows))) : Math.ceil(rows / 64) * 64);
+const captured = {};         // "model:variant:size" -> promise of {session, buffer, input} | null
 
-async function infer(s, model, x, dims) {
-  const rows = dims[0];
-  const size = padTo(rows);
-  if (provider !== "webgpu" || size === rows || unpadded.has(model)) {
-    return s.run({ x: new ort.Tensor("float32", x, dims) });
+function capturedRun(model, variant, size, rest) {
+  const key = `${model}:${variant}:${size}`;
+  if (!(key in captured)) {
+    captured[key] = (async () => {
+      try {
+        const session = await ort.InferenceSession.create(await bytesOf(fileOf(model, variant)), {
+          executionProviders: ["webgpu"], graphOptimizationLevel: "all",
+          freeDimensionOverrides: { batch: size }, enableGraphCapture: true,
+          preferredOutputLocation: "gpu-buffer",
+        });
+        const device = ort.env.webgpu.device;
+        const floats = size * rest.reduce((a, b) => a * b, 1);
+        const buffer = device.createBuffer({
+          size: floats * 4,
+          usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+        });
+        const input = ort.Tensor.fromGpuBuffer(buffer, { dataType: "float32", dims: [size, ...rest] });
+        return { session, buffer, input, device };
+      } catch (err) {
+        console.warn(`no graph capture for ${model} (${variant}, ${size}):`, err.message || err);
+        return null;
+      }
+    })();
   }
-  const padded = new Float32Array(size * (x.length / rows));
-  padded.set(x, 0);
-  const out = await s.run({ x: new ort.Tensor("float32", padded, [size, ...dims.slice(1)]) });
+  return captured[key];
+}
+
+async function infer(model, variant, x, dims) {
+  const rows = dims[0];
+  if (provider !== "webgpu") {
+    return (await session(model, variant)).run({ x: new ort.Tensor("float32", x, dims) });
+  }
+  const size = unpadded.has(model) ? rows : padTo(rows);
+  let padded = x;
+  if (size !== rows) {
+    padded = new Float32Array(size * (x.length / rows));
+    padded.set(x, 0);
+  }
+  const shape = [size, ...dims.slice(1)];
+  const cap = unpadded.has(model) ? null : await capturedRun(model, variant, size, dims.slice(1));
+  let out;
+  if (cap) {
+    cap.device.queue.writeBuffer(cap.buffer, 0, padded);
+    const got = await cap.session.run({ x: cap.input });
+    out = {};
+    for (const [name, t] of Object.entries(got)) {
+      out[name] = { dims: t.dims.slice(), data: await t.getData() };
+      t.dispose();
+    }
+  } else {
+    out = await (await session(model, variant)).run({ x: new ort.Tensor("float32", padded, shape) });
+  }
+  if (size === rows) return out;
   const cut = {};
   for (const [name, t] of Object.entries(out)) {
-    if (t.dims[0] !== size) { unpadded.add(model); return infer(s, model, x, dims); }
+    if (t.dims[0] !== size) { unpadded.add(model); return infer(model, variant, x, dims); }
     cut[name] = { dims: [rows, ...t.dims.slice(1)], data: t.data.subarray(0, (t.data.length / size) * rows) };
   }
   return cut;
 }
 
-async function run({ id, model, variant, dims, n, chunk }) {
+// A job: take positions from the shared counter until none are left -- or,
+// with `first` and `count`, exactly those (the GPU's share of a batch it
+// splits with the CPU workers, who take the rest from the counter).
+async function run({ id, model, variant, dims, n, chunk, first, count }) {
   const row = dims.slice(1).reduce((a, b) => a * b, 1);
   let answered = 0;
   try {
     await started;
-    const s = await session(model, variant);
     const names = models[model].outputs;
+    let fixed = count !== undefined;
     for (;;) {
       if (Atomics.load(job, 0) !== id) break;           // given up on by the engine
-      const from = Atomics.add(job, 1, chunk);
-      if (from >= n) break;
-      const rows = Math.min(chunk, n - from);
+      let from, rows;
+      if (fixed) {
+        if (count <= 0) break;
+        from = first; rows = count; count = 0;
+      } else {
+        from = Atomics.add(job, 1, chunk);
+        if (from >= n) break;
+        rows = Math.min(chunk, n - from);
+      }
       const d = dims.slice();
       d[0] = rows;
-      const out = await infer(s, model, input.slice(from * row, (from + rows) * row), d);
+      const out = await infer(model, variant, input.slice(from * row, (from + rows) * row), d);
       // Where each output goes: see the layout above.
       const whole = rows === n;
       if (!whole && names.some(name => out[name].dims[0] !== rows)) {
@@ -167,7 +241,11 @@ self.onmessage = async ({ data: msg }) => {
     started = load(msg.backend, msg.threads, msg.forceGpu);
     if (msg.backend === "webgpu") {
       // Tell the engine whether it has a GPU to choose.
-      started.then(() => Atomics.store(job, GPU, 1),
+      started.then(() => {
+        // Half precision only where the GPU has 16-bit float shaders.
+        Atomics.store(job, HALF, gpuHalf ? 1 : 0);
+        Atomics.store(job, GPU, 1);
+      },
                    err => { Atomics.store(job, GPU, 2); console.warn("WebGPU:", err.message || err); });
     }
     try { await started; } catch (err) { return; }
