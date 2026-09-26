@@ -66,8 +66,22 @@
       networks.push(worker);
       ports.push(channel.port2);
     }
-    engine.postMessage(Object.assign({}, extra, { type: "init", sab, layout, ports, models }),
-                       ports);
+    // The v3 bot's exact solver, on a worker of its own (solver-worker.js):
+    // it answers the engine through a small shared buffer of its own.
+    // (Not with `workers: 0`, the site as it was.)
+    let solver = undefined;
+    const transfer = [...ports];
+    if (workers > 1) {
+      const solverSab = new SharedArrayBuffer(64 + 64 * 1024);
+      const channel = new MessageChannel();
+      const worker = new Worker("solver-worker.js");
+      worker.postMessage({ type: "init", sab: solverSab, port: channel.port1 }, [channel.port1]);
+      networks.push(worker);
+      solver = { sab: solverSab, port: channel.port2 };
+      transfer.push(channel.port2);
+    }
+    engine.postMessage(Object.assign({}, extra, { type: "init", sab, layout, ports, models, solver }),
+                       transfer);
     return { engine, networks };
   }
 

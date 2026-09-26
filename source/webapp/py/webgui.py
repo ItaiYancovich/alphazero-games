@@ -416,6 +416,77 @@ def _v3_evaluator(ckpt: str, backend: str):
 SOLVE_SLICE = 0.08
 
 
+class RemoteSolver:
+    """``uttt_rs.Searcher(1)`` -- the v3 bot's exact solver -- on a worker of
+    its own (solver-worker.js), as the desktop runs it on a thread of its own.
+
+    The methods rs_agent calls on its solver answer as the native ones do; the
+    position set by ``set_root_state`` goes with each request.  ``start``,
+    ``poll`` and ``stop`` are for the long solves -- beside the bot's search,
+    and while the human thinks -- which run on the worker while the search
+    goes on here.
+    """
+
+    def __init__(self):
+        self._state: dict = {}
+
+    def set_root_state(self, t: int, x, o, active: int, stm: int) -> None:
+        self._state = dict(x=[int(v) for v in x], o=[int(v) for v in o],
+                           active=int(active), stm=int(stm))
+
+    def _call(self, op: str, **kw):
+        import js
+
+        return json.loads(js.solverCall(json.dumps(dict(self._state, op=op, **kw))))
+
+    def root_open_empties(self, t: int) -> int:
+        return int(self._call("empties"))
+
+    def root_canonical(self, t: int) -> bytes:
+        return bytes(self._call("canonical"))
+
+    def root_solve(self, t: int, budget: int, stop_on_win: bool = False, seconds: float = 0.0):
+        return [(int(m), int(v)) for m, v in self._call("solve", budget=float(budget),
+                                                        stop=bool(stop_on_win),
+                                                        seconds=float(seconds))]
+
+    def start(self, seconds: float, empties: int) -> int:
+        """Solve the position for up to ``seconds`` (none if more than ``empties``
+        cells are open), in the background.  Returns the job."""
+        import js
+
+        return int(js.solverStart(json.dumps(dict(self._state, op="job", seconds=float(seconds),
+                                                  empties=int(empties)))))
+
+    def poll(self, job: int):
+        """``(pairs or None, seconds)`` once the job is done, else ``None``."""
+        import js
+
+        return self._unpack(js.solverPoll(job))
+
+    def stop(self, job: int, wait: float = 0.3):
+        """Cancel the job; its answer, if it gives one within ``wait`` seconds."""
+        import js
+
+        return self._unpack(js.solverStop(job, wait * 1000))
+
+    @staticmethod
+    def _unpack(text):
+        if text is None:
+            return None
+        got = json.loads(text)
+        pairs = got.get("pairs")
+        return ([(int(m), int(v)) for m, v in pairs] if pairs is not None else None,
+                got.get("ms", 0) / 1000)
+
+
+def _solver_worker() -> bool:
+    import js
+
+    ready = getattr(js, "solverReady", None)
+    return ready is not None and bool(ready())
+
+
 def _install_v3_agent() -> None:
     """Swap ``rs_agent.PonderingAgent`` for a version that needs no threads.
 
@@ -453,6 +524,11 @@ def _install_v3_agent() -> None:
             agent = getattr(self.target, "__self__", None)
             beside = getattr(agent, "_beside", None)
             if beside is not None:
+                if beside.get("job") and not beside["done"]:
+                    # As the desktop's join waits out the solver's last slice.
+                    got = agent._solver.stop(beside["job"])
+                    if got is not None:
+                        agent._settle_beside(beside, got)
                 beside["out"]["seconds"] = beside.get("spent", 0.0)
                 agent._beside = None
 
@@ -468,6 +544,13 @@ def _install_v3_agent() -> None:
             # own once the device's tuning has put it on the GPU.
             self._gpu_batch = self.batch
             self.batch = min(self.batch, 48)
+            # The exact solver on a worker of its own, where the page made one:
+            # it then runs beside the search, as on the desktop, instead of in
+            # slices between the search's batches.
+            self._remote = self._solver is not None and _solver_worker()
+            if self._remote:
+                self._solver = RemoteSolver()
+            self._ponder_job = 0
             self._beside = None
             self._pondering = False
             self._ponder_until = 0.0
@@ -477,6 +560,19 @@ def _install_v3_agent() -> None:
         def _serve_beside(self) -> None:
             beside = self._beside
             if beside is None or beside["done"]:
+                return
+            if self._remote:
+                # The solver is on its own worker: set it going, then only
+                # look for its answer between the search's batches.
+                if not beside["init"]:
+                    beside["init"] = True
+                    beside["spent"] = 0.0
+                    self._solver.set_root_state(0, *self._masks(beside["board"]))
+                    beside["job"] = self._solver.start(beside["seconds"], self.root_solve_empties)
+                    return
+                got = self._solver.poll(beside["job"])
+                if got is not None:
+                    self._settle_beside(beside, got)
                 return
             if not beside["init"]:
                 beside["init"] = True
@@ -497,6 +593,15 @@ def _install_v3_agent() -> None:
                 beside["out"]["result"] = got
                 beside["settled"].set()
                 beside["done"] = True
+
+        def _settle_beside(self, beside: dict, got) -> None:
+            pairs, spent = got
+            beside["spent"] = spent
+            beside["done"] = True
+            result = self._classify(pairs) if pairs else None
+            if result is not None:
+                beside["out"]["result"] = result
+                beside["settled"].set()
 
         def _choose_batch(self) -> None:
             """48 positions a batch on the CPU; the desktop's 128 on a GPU."""
@@ -559,10 +664,20 @@ def _install_v3_agent() -> None:
             self._ponder_solve = (after.copy() if self._solver is not None and after is not None
                                   and not after.is_terminal() else None)
             self._ponder_solve_ready = False
+            if self._remote and self._ponder_solve is not None:
+                # The solver works on the position the human has to answer
+                # for as long as pondering lasts, on its worker.
+                self._solver.set_root_state(0, *self._masks(self._ponder_solve))
+                self._ponder_job = self._solver.start(
+                    self.ponder_limit, self.root_solve_empties + self.PONDER_SOLVE_MARGIN)
+                self._ponder_solve = None
 
         def stop_ponder(self) -> None:
             self._pondering = False
             self._ponder_solve = None
+            if self._ponder_job:
+                self._solver.stop(self._ponder_job, 0.0)
+                self._ponder_job = 0
 
         def pondering(self) -> bool:
             if self._pondering and time.perf_counter() > self._ponder_until:

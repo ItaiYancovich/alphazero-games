@@ -12,7 +12,9 @@ has build outputs.
 | Search beside the network (web only, off: `BACKGROUND` in `webgui.py`) | `run_search` in `alphazero_core/mcts.py`; `evaluate_start` in the evaluators; `WebNet.start` in `webgui.py` |
 | UTTT analysis and review on the v3 network (web only) | `V3Judge`, `_judge_uttt_with_v3` in `webapp/py/webgui.py` |
 | Evaluation cache | `EvalCache` in `webapp/py/webgui.py` |
-| GPU (WebGPU) worker | `load` in `webapp/static/ort-worker.js`, `gpuSlot` / `"gpu:f"` in `engine-worker.js`, `pool.js` |
+| GPU (WebGPU) worker | `load`, `infer` in `webapp/static/ort-worker.js`; `gpuSlot`, `planOf` in `engine-worker.js`; `pool.js` |
+| GPU versions of the v3 network | `webapp/gpu_models.py` -> `models/uttt_v3_gpu.onnx`, `uttt_v3_gpu16.onnx` |
+| v3 exact solver on its own worker | `webapp/static/solver-worker.js`, `uttt-core.js`; `RemoteSolver` in `webgui.py` |
 | 8-bit networks | `webapp/quantize.py` -> `models/*_int8.onnx` |
 | UTTT v3 match bot | `alphazero_uttt/rs_agent.py`, Rust core in `uttt_rs/` |
 | Web layer: loaders, v3 agent without threads, session stepping | `webapp/py/webgui.py` (see `WebPonderingAgent.run`, `ponder_tick`) |
@@ -67,9 +69,34 @@ than 3x slower than the best seen is dropped after one timing, and where the
 GPU loses that badly it is not tried again for that network at smaller
 batches. A software GPU (the browser's CPU fallback) is not used at all;
 `bench.html?gpu=force` uses it anyway, for testing. The GPU worker rounds
-batches up to 8, 16, 32, 64 or a multiple of 32, so it compiles shaders for
+batches up to 16, 32, 64, 128 or a multiple of 64, so it sets up sessions for
 only a few shapes. When the tuning has put the v3 network on the GPU, the v3
 bot searches with the desktop's batches of 128 instead of 48.
+
+On the GPU each batch size gets its own session with the batch fixed
+(`freeDimensionOverrides`) and graph capture (the first run is recorded, the
+rest replay it, sparing the per-step overhead of a network of many small
+steps), its input kept in one GPU buffer; a size where capture is refused
+falls back to an ordinary session. The GPU choices are `gpu:f` (float),
+`gpu:h` (half precision, only where the GPU has `shader-f16` and the network
+a `gpu16_file`) and `mix:<gpu><cpu>` (e.g. `mix:h8`): the GPU takes a share
+of the batch in proportion to its measured speed and the whole CPU pool the
+rest, from the shared counter.
+
+The v3 network has GPU versions (`webapp/gpu_models.py`): onnxruntime-web has
+no WebGPU Softplus, so the original ran four steps of every call on the CPU
+and could not be captured; `uttt_v3_gpu.onnx` computes Softplus from ops the
+GPU has (outputs within 4e-6), and `uttt_v3_gpu16.onnx` is that in half
+precision (value within 0.006, like the desktop's). The CPU keeps the
+original, so its moves stay the desktop's.
+
+**The v3 bot's exact solver** runs on a worker of its own (`solver-worker.js`,
+a second copy of the native core), as it runs on a thread of its own on the
+desktop: beside the bot's search, and on the position you must answer while
+you think. `RemoteSolver` in `webgui.py` stands in for the agent's solver; the
+long solves go to the worker and the search only looks for the answer between
+batches, instead of giving the solver 0.08 s slices of its own time. With
+`workers: 0` (bench.html's "before") the solver stays in the engine, as before.
 
 **8-bit networks:** Hex, Connect Four and UTTT (the "az" bots) have 8-bit
 versions: `models/<name>_int8.onnx`, with the float file kept as `float_file`
