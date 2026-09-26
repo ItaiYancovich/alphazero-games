@@ -32,11 +32,16 @@
   // its own, with every network loaded up front.  Beside it are `workers`
   // more on one thread each -- the pool -- which load a network when first
   // asked for it.  `workers: 0` is the site as it was before the pool.
-  function spawn(models, { workers = defaultWorkers(), extra = {} } = {}) {
-    const count = 1 + (workers > 1 ? workers : 0);
+  //
+  // Where the browser has WebGPU, one more worker runs the networks on the
+  // graphics card; it is last, and `layout.gpu` says so.  `gpu: false` leaves
+  // it out.
+  function spawn(models, { workers = defaultWorkers(), gpu = true, extra = {} } = {}) {
+    const withGpu = gpu && workers > 1 && !!navigator.gpu;
+    const count = 1 + (workers > 1 ? workers : 0) + (withGpu ? 1 : 0);
     // The shared buffer (see ort-worker.js): the job block, a control block
     // per worker, then the input and the output.
-    const layout = { job: 0, ctl: [] };
+    const layout = { job: 0, ctl: [], gpu: withGpu ? count - 1 : -1 };
     let bytes = 64;
     for (let i = 0; i < count; i++) { layout.ctl.push(bytes); bytes += CTL_INTS * 4; }
     Object.assign(layout, { input: bytes, inputFloats: INPUT_FLOATS });
@@ -54,7 +59,10 @@
       };
       worker.postMessage({ type: "init", sab, layout: Object.assign({}, layout, { ctl: layout.ctl[i] }),
                            models, port: channel.port1, lazy: i > 0,
-                           threads: i > 0 ? 1 : undefined }, [channel.port1]);
+                           threads: i > 0 ? 1 : undefined,
+                           backend: i === layout.gpu ? "webgpu" : "wasm",
+                           // ?gpu=force: use even a software GPU (for testing).
+                           forceGpu: /[?&]gpu=force\b/.test(location.search) }, [channel.port1]);
       networks.push(worker);
       ports.push(channel.port2);
     }

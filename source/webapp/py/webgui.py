@@ -463,8 +463,10 @@ def _install_v3_agent() -> None:
     class WebPonderingAgent(base):
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
-            # Smaller batches than the desktop's GPU wants: a browser network
-            # call is on the CPU, and a request should never wait long.
+            # Smaller batches than the desktop's GPU wants when the network
+            # runs on the CPU, so a request never waits long; the desktop's
+            # own once the device's tuning has put it on the GPU.
+            self._gpu_batch = self.batch
             self.batch = min(self.batch, 48)
             self._beside = None
             self._pondering = False
@@ -496,8 +498,17 @@ def _install_v3_agent() -> None:
                 beside["settled"].set()
                 beside["done"] = True
 
+        def _choose_batch(self) -> None:
+            """48 positions a batch on the CPU; the desktop's 128 on a GPU."""
+            import js
+
+            on_gpu = getattr(js, "gpuBest", None)
+            self.batch = self._gpu_batch if on_gpu is not None and on_gpu("uttt_v3") \
+                else min(self._gpu_batch, 48)
+
         def run(self, board, time_budget, max_sims, extend=None, stop=None):
             """``RsSearchAgent.run``, taking turns with the solver between batches."""
+            self._choose_batch()
             extend = self.extend if extend is None else extend
             reused = self._set_root(board)
             start_n = self.search.root_n(0)
@@ -561,6 +572,7 @@ def _install_v3_agent() -> None:
         def ponder_tick(self) -> None:
             """One batch of search on the tree the next move will use, then a
             slice of the solver on the position the human has to answer."""
+            self._choose_batch()
             if not self.pondering():
                 return
             with self._lock:

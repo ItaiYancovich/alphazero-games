@@ -57,9 +57,10 @@
      networks) and <b>after</b> (a pool of network workers tuned to this device, 8-bit or
      full-precision networks, whichever this device runs faster, and an evaluation cache). They run after–before–before–after, so a phone that slows
      down as it warms up is fair to both.</p>
-  <p>Takes about 4–7 minutes: first a minute of the bots playing, untimed, so the phone is
-     already as warm as it gets in a real game, then the timed rounds. Keep this tab in
-     front and the screen on; plugged in and not in low-power mode is best.</p>
+  <p>Takes about 5–9 minutes: first a minute of the bots playing, untimed, so the device is
+     already as warm as it gets in a real game, then the timed rounds, then each network on
+     its own (CPU and, where the browser has one, GPU). Keep this tab in front and the
+     screen on; plugged in and not in low-power mode is best.</p>
 
   <div class="card">
     <div class="row">
@@ -75,6 +76,12 @@
        thinks for 2 seconds a move, simulations per second (higher is better).</p>
     <table id="summary"></table>
     <p id="tuned"></p>
+  </div>
+
+  <div class="card scroll" id="nets-card" hidden>
+    <p>Each network on its own: milliseconds per position (lower is better), CPU — the
+       fastest of the old setup and the pool — against the GPU, at two batch sizes.</p>
+    <table id="nets"></table>
   </div>
 
   <div class="card" id="raw-card" hidden>
@@ -142,6 +149,39 @@ def play(key, choice, sims, plies, size):
 json.dumps([play(*c) for c in CASES])
 `;
 
+// Last, the networks themselves: each one timed on each way of running it, at
+// a few batch sizes, with random positions (the time does not depend on them).
+const NET_PY = `
+import json, time, js
+import numpy as np
+import webgui as W
+W.CACHE.enabled = False
+info = json.loads(js.benchInfo())
+rng = np.random.default_rng(0)
+out = {}
+for name in ["hex", "c4", "uttt", "rps2", "uttt_v3"]:
+    meta = W._MODELS[name]
+    ways = ["old:f"] + (["old:8"] if meta.get("float_file") else [])
+    if info["pool"] > 1:
+        ways += [f"{info['pool']}x1:f"] + ([f"{info['pool']}x1:8"] if meta.get("float_file") else [])
+    if info["gpu"]:
+        ways += ["gpu:f"]
+    res = {}
+    for way in ways:
+        js.benchChoice(way)
+        for n in (8, 16, 48, 128):
+            x = (rng.random((n, *meta["input_shape"])) < 0.3).astype(np.float32)
+            for _ in range(2):
+                W._infer(name, x)
+            t = time.perf_counter()
+            for _ in range(3):
+                W._infer(name, x)
+            res[f"{way} b{n}"] = round(1000 * (time.perf_counter() - t) / 3 / n, 3)
+    out[name] = res
+js.benchChoice("")
+json.dumps(out)
+`;
+
 const WARMUP_PY = `
 import time
 import webgui as W
@@ -195,8 +235,21 @@ function progress(text, frac) {
   if (frac != null) $("bar").style.width = `${Math.round(frac * 100)}%`;
 }
 
+// The GPU the browser offers, if any: its name, and whether it is only a
+// software stand-in (which the site does not use).
+async function gpuInfo() {
+  try {
+    const a = navigator.gpu && await navigator.gpu.requestAdapter();
+    if (!a) return navigator.gpu ? "no adapter" : "no WebGPU";
+    const i = a.info || {};
+    return [i.vendor, i.architecture, i.description].filter(Boolean).join(" ")
+      + (a.isFallbackAdapter || i.isFallbackAdapter ? " (software)" : "");
+  } catch (err) { return "error: " + (err.message || err); }
+}
+
 async function start() {
   $("go").disabled = true;
+  device.gpu = await gpuInfo();
   if (!self.crossOriginIsolated) {
     progress("This browser did not enable cross-origin isolation; reload the page once and try again.");
     $("go").disabled = false;
@@ -232,6 +285,13 @@ async function start() {
       results[name].push({ boot: Math.round(s.boot), cases: JSON.parse(reply.result) });
       render();
     }
+    progress("Last: timing each network on each way of running it…", 0.97);
+    const s = await setup(models, undefined, tuned);
+    const reply = await s.run(NET_PY);
+    s.stop();
+    if (reply.result.startsWith("ERROR")) throw new Error(reply.result);
+    results.networks = JSON.parse(reply.result);
+    render();
     progress("Done. Tap “Copy results” and paste them into the chat.", 1);
   } catch (err) {
     progress("Stopped: " + (err && err.message || err));
@@ -285,6 +345,17 @@ function render() {
     $("tuned").textContent = `This device reports ${device.cores} cores; the pool has `
       + `${tuned.workers} network workers. Networks: ${bits || "not chosen yet"}. `
       + `Learned spreads: ${picks || "none yet"}.`;
+  }
+  if (results.networks) {
+    const fmt = v => (v == null ? "–" : v.toFixed(2));
+    let rows = "<tr><th>Network</th><th>CPU ×48</th><th>GPU ×48</th><th>CPU ×128</th><th>GPU ×128</th></tr>";
+    for (const [name, r] of Object.entries(results.networks)) {
+      const cpu = n => Math.min(...Object.entries(r).filter(([k]) => !k.startsWith("gpu") && k.endsWith(` b${n}`)).map(([, v]) => v));
+      rows += `<tr><td>${name}</td><td>${fmt(cpu(48))}</td><td>${fmt(r["gpu:f b48"])}</td>`
+        + `<td>${fmt(cpu(128))}</td><td>${fmt(r["gpu:f b128"])}</td></tr>`;
+    }
+    $("nets").innerHTML = rows;
+    $("nets-card").hidden = false;
   }
   $("raw").value = JSON.stringify({ device, tuned, results }, null, 1);
   $("raw-card").hidden = false;

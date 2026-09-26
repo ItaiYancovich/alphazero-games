@@ -12,6 +12,7 @@ has build outputs.
 | Search beside the network (web only, off: `BACKGROUND` in `webgui.py`) | `run_search` in `alphazero_core/mcts.py`; `evaluate_start` in the evaluators; `WebNet.start` in `webgui.py` |
 | UTTT analysis and review on the v3 network (web only) | `V3Judge`, `_judge_uttt_with_v3` in `webapp/py/webgui.py` |
 | Evaluation cache | `EvalCache` in `webapp/py/webgui.py` |
+| GPU (WebGPU) worker | `load` in `webapp/static/ort-worker.js`, `gpuSlot` / `"gpu:f"` in `engine-worker.js`, `pool.js` |
 | 8-bit networks | `webapp/quantize.py` -> `models/*_int8.onnx` |
 | UTTT v3 match bot | `alphazero_uttt/rs_agent.py`, Rust core in `uttt_rs/` |
 | Web layer: loaders, v3 agent without threads, session stepping | `webapp/py/webgui.py` (see `WebPonderingAgent.run`, `ponder_tick`) |
@@ -57,6 +58,18 @@ not in this repo, so don't run `build.py --models`. To change a network here
 (an 8-bit version, say), work from the `.onnx` files in `models/` and add or
 adjust its entry in `models/models.json`. If a new checkpoint name is used,
 also update `PLACEMENTS` in `build.py` and rebuild so `engine.json` matches.
+
+**GPU:** where the browser has WebGPU, `pool.js` adds one more network
+worker that loads onnxruntime-web's WebGPU build (`ort/ort.webgpu.min.mjs` and
+the `.jsep` files) and runs the float networks on the graphics card. It is one
+more choice for the tuning (`"gpu:f"`), timed like the rest; a choice more
+than 3x slower than the best seen is dropped after one timing, and where the
+GPU loses that badly it is not tried again for that network at smaller
+batches. A software GPU (the browser's CPU fallback) is not used at all;
+`bench.html?gpu=force` uses it anyway, for testing. The GPU worker rounds
+batches up to 8, 16, 32, 64 or a multiple of 32, so it compiles shaders for
+only a few shapes. When the tuning has put the v3 network on the GPU, the v3
+bot searches with the desktop's batches of 128 instead of 48.
 
 **8-bit networks:** Hex, Connect Four and UTTT (the "az" bots) have 8-bit
 versions: `models/<name>_int8.onnx`, with the float file kept as `float_file`
