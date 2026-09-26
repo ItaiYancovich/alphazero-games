@@ -74,14 +74,19 @@ only a few shapes. When the tuning has put the v3 network on the GPU, the v3
 bot searches with the desktop's batches of 128 instead of 48.
 
 On the GPU each batch size gets its own session with the batch fixed
-(`freeDimensionOverrides`) and graph capture (the first run is recorded, the
-rest replay it, sparing the per-step overhead of a network of many small
-steps), its input kept in one GPU buffer; a size where capture is refused
-falls back to an ordinary session. The GPU choices are `gpu:f` (float),
-`gpu:h` (half precision, only where the GPU has `shader-f16` and the network
-a `gpu16_file`) and `mix:<gpu><cpu>` (e.g. `mix:h8`): the GPU takes a share
+(`freeDimensionOverrides`) and, where it proves correct, graph capture (the
+first run is recorded, the rest replay it, sparing the per-step overhead of a
+network of many small steps), its input kept in one GPU buffer.
+onnxruntime-web's replay ignored new input for Hex and Connect Four (it
+answered the recorded positions again), so every captured session is replayed
+once on fresh random positions and compared with an uncaptured one before it
+is used; where they disagree, that size runs uncaptured. The tuning's GPU
+choices are `gpu:f` and `mix:f<cpu>` (e.g. `mix:f8`): the GPU takes a share
 of the batch in proportion to its measured speed and the whole CPU pool the
-rest, from the shared counter.
+rest, from the shared counter. Half precision (`gpu:h`, `mix:h?`: only where
+the GPU has `shader-f16` and the network a `gpu16_file`) is timed by
+bench.html but not used by the bots: on an Iris Xe its values strayed up to
+0.04 from float.
 
 The v3 network has GPU versions (`webapp/gpu_models.py`): onnxruntime-web has
 no WebGPU Softplus, so the original ran four steps of every call on the CPU

@@ -103,41 +103,84 @@ function session(name, variant) {
 // to a few sizes (16, 32, 64, 128, then multiples of 64), padded with empty
 // positions whose answers are dropped.  (engine-worker.js's `gpuPad` agrees.)
 //
-// Each size gets a session of its own with the batch fixed, and graph capture:
-// the first run is recorded and the rest replay it, which saves the GPU the
-// overhead of setting up each of a network's many small steps every time.
-// The input stays in one GPU buffer, rewritten each call, as capture needs.
-// Where capture is refused (a step the GPU cannot run), the size falls back
-// to one ordinary session for all sizes.
+// Each size gets a session of its own with the batch fixed, and graph capture
+// where it works: the first run is recorded and the rest replay it, which
+// saves the GPU the overhead of setting up each of a network's many small
+// steps every time.  The input stays in one GPU buffer, rewritten each call,
+// as capture needs.
+//
+// Capture is checked before it is trusted.  onnxruntime-web's replay was
+// found to ignore new input for some networks (Hex and Connect Four: every
+// replay answered the recorded positions again) while getting others right
+// (Ultimate, v3).  So a captured session is recorded with one set of random
+// positions, replayed with another, and used only if that replay agrees with
+// the same network run without capture; otherwise the size runs uncaptured.
 const unpadded = new Set();  // networks whose outputs do not lead with the batch
 const padTo = rows => (rows <= 128 ? Math.max(16, 2 ** Math.ceil(Math.log2(rows))) : Math.ceil(rows / 64) * 64);
-const captured = {};         // "model:variant:size" -> promise of {session, buffer, input} | null
+const runners = {};          // "model:variant:size" -> promise of (input) -> outputs
 
-function capturedRun(model, variant, size, rest) {
+function randomInput(n) {
+  const x = new Float32Array(n);
+  for (let i = 0; i < n; i++) x[i] = Math.random() < 0.3 ? 1 : 0;
+  return x;
+}
+
+function gpuRunner(model, variant, size, rest) {
   const key = `${model}:${variant}:${size}`;
-  if (!(key in captured)) {
-    captured[key] = (async () => {
+  if (!(key in runners)) {
+    runners[key] = (async () => {
+      const bytes = await bytesOf(fileOf(model, variant));
+      const dims = [size, ...rest];
+      const floats = size * rest.reduce((a, b) => a * b, 1);
+      let fixed;
       try {
-        const session = await ort.InferenceSession.create(await bytesOf(fileOf(model, variant)), {
+        const s = await ort.InferenceSession.create(bytes, {
+          executionProviders: ["webgpu"], graphOptimizationLevel: "all",
+          freeDimensionOverrides: { batch: size },
+        });
+        fixed = async x => s.run({ x: new ort.Tensor("float32", x, dims) });
+      } catch (err) {
+        // The dynamic session, fed the padded batch.
+        const s = await session(model, variant);
+        fixed = async x => s.run({ x: new ort.Tensor("float32", x, dims) });
+      }
+      try {
+        const s = await ort.InferenceSession.create(bytes, {
           executionProviders: ["webgpu"], graphOptimizationLevel: "all",
           freeDimensionOverrides: { batch: size }, enableGraphCapture: true,
           preferredOutputLocation: "gpu-buffer",
         });
         const device = ort.env.webgpu.device;
-        const floats = size * rest.reduce((a, b) => a * b, 1);
         const buffer = device.createBuffer({
           size: floats * 4,
           usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
         });
-        const input = ort.Tensor.fromGpuBuffer(buffer, { dataType: "float32", dims: [size, ...rest] });
-        return { session, buffer, input, device };
+        const input = ort.Tensor.fromGpuBuffer(buffer, { dataType: "float32", dims });
+        const replay = async x => {
+          device.queue.writeBuffer(buffer, 0, x);
+          const got = await s.run({ x: input });
+          const out = {};
+          for (const [name, t] of Object.entries(got)) out[name] = { dims: t.dims.slice(), data: await t.getData() };
+          return out;
+        };
+        await replay(randomInput(floats));                   // recorded
+        const probe = randomInput(floats);
+        const a = await replay(probe), b = await fixed(probe);  // replayed, and not
+        let worst = 0;
+        for (const name of Object.keys(b)) {
+          for (let i = 0; i < b[name].data.length; i++) {
+            worst = Math.max(worst, Math.abs(a[name].data[i] - b[name].data[i]));
+          }
+        }
+        if (!(worst < 1e-3)) throw new Error(`replay disagrees by ${worst}`);
+        return replay;
       } catch (err) {
         console.warn(`no graph capture for ${model} (${variant}, ${size}):`, err.message || err);
-        return null;
+        return fixed;
       }
     })();
   }
-  return captured[key];
+  return runners[key];
 }
 
 async function infer(model, variant, x, dims) {
@@ -151,20 +194,9 @@ async function infer(model, variant, x, dims) {
     padded = new Float32Array(size * (x.length / rows));
     padded.set(x, 0);
   }
-  const shape = [size, ...dims.slice(1)];
-  const cap = unpadded.has(model) ? null : await capturedRun(model, variant, size, dims.slice(1));
-  let out;
-  if (cap) {
-    cap.device.queue.writeBuffer(cap.buffer, 0, padded);
-    const got = await cap.session.run({ x: cap.input });
-    out = {};
-    for (const [name, t] of Object.entries(got)) {
-      out[name] = { dims: t.dims.slice(), data: await t.getData() };
-      t.dispose();
-    }
-  } else {
-    out = await (await session(model, variant)).run({ x: new ort.Tensor("float32", padded, shape) });
-  }
+  const run = unpadded.has(model) ? null : await gpuRunner(model, variant, size, dims.slice(1));
+  const out = run ? await run(padded)
+    : await (await session(model, variant)).run({ x: new ort.Tensor("float32", padded, [size, ...dims.slice(1)]) });
   if (size === rows) return out;
   const cut = {};
   for (const [name, t] of Object.entries(out)) {

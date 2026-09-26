@@ -211,9 +211,11 @@ const hasInt8 = model => !!(netMeta[model] && netMeta[model].float_file);
 // this network and batch size.
 function spreadChoices(p, key) {
   const gpu = gpuPossible() && !(key && gpuBeaten(key));
-  const model = key ? key.split("|")[0] : "";
-  const half = gpuHalf() && !!(netMeta[model] && netMeta[model].gpu16_file);
-  const gpus = !gpu ? [] : half ? ["f", "h"] : ["f"];
+  // Float only.  Half precision ("gpu:h", "mix:h?") runs where the GPU has it,
+  // and bench.html times it, but the bots do not use it: on an Intel Iris Xe
+  // its values strayed up to 0.04 from the float network's, against 0.006
+  // measured on the CPU -- too far to take without a strength check.
+  const gpus = gpu ? ["f"] : [];
   const mixes = setups.length > 1 ? gpus.map(g => `mix:${g}${p}`) : [];
   return [...new Set(["old:f", ...setups.map(s => `${s}:${p}`), ...gpus.map(g => `gpu:${g}`), ...mixes])];
 }
