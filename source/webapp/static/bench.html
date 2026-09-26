@@ -170,10 +170,11 @@ for name in ["hex", "c4", "uttt", "rps2", "uttt_v3"]:
         gpus = ["f"] + (["h"] if info["half"] and meta.get("gpu16_file") else [])
         ways += [f"gpu:{g}" for g in gpus]
         if info["pool"] > 1:
-            cpu = "8" if meta.get("float_file") else "f"
-            ways += [f"mix:{g}{cpu}" for g in gpus]
+            # Float on the CPU side too, so the check below measures the GPU.
+            ways += [f"mix:{g}f" for g in gpus]
     res = {}
     xs = {n: (rng.random((n, *meta["input_shape"])) < 0.3).astype(np.float32) for n in (8, 16, 48, 128)}
+    other = {n: (rng.random((n, *meta["input_shape"])) < 0.3).astype(np.float32) for n in xs}
     ref = {}
     for way in ways:
         js.benchChoice(way)
@@ -184,11 +185,16 @@ for name in ["hex", "c4", "uttt", "rps2", "uttt_v3"]:
             for _ in range(3):
                 W._infer(name, x)
             res[f"{way} b{n}"] = round(1000 * (time.perf_counter() - t) / 3 / n, 3)
-            # How far the GPU's answers are from the float CPU's.
+            # How far the GPU's answers are from the float CPU's -- on other
+            # positions than it has seen, too: a recorded GPU run that
+            # replayed stale answers would look right on the same ones.
             if way == "old:f":
                 ref[n] = first[1]
+                ref[-n] = W._infer(name, other[n])[1]
             elif way.startswith(("gpu", "mix")):
-                res[f"{way} b{n} value_diff"] = round(float(np.abs(first[1] - ref[n]).max()), 5)
+                again = W._infer(name, other[n])[1]
+                res[f"{way} b{n} value_diff"] = round(float(max(np.abs(first[1] - ref[n]).max(),
+                                                                  np.abs(again - ref[-n]).max())), 5)
     out[name] = res
 js.benchChoice("")
 json.dumps(out)
